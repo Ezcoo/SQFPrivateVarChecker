@@ -4,6 +4,11 @@
   "description": "Checks all local variables and informs the user if there are non-private local vars.",
   "version": "0.0.1",
   "icon": "resources/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Ezcoo/SQFPrivateVarChecker"
+  },
+  "license": "MIT",
   "engines": {
     "vscode": "^1.138.0"
   },
