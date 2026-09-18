@@ -1,6 +1,7 @@
 {
   "name": "sqf-private-variable-checker",
   "displayName": "SQF Private Variable Checker",
+  "publisher": "Ezcoo",
   "description": "Checks all local variables and informs the user if there are non-private local vars.",
   "version": "0.0.1",
   "icon": "resources/icon.png",
