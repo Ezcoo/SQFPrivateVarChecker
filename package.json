@@ -16,6 +16,11 @@
   "categories": [
     "Linters"
   ],
+  "keywords": [
+    "Arma",
+    "Arma3",
+    "SQF"
+  ],
   "activationEvents": [
     "onLanguage:sqf",
     "workspaceContains:**/*.sqf"
