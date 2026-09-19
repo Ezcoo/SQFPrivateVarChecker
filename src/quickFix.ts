@@ -1,5 +1,16 @@
 import * as vscode from 'vscode';
-import { DIAGNOSTIC_CODE, DIAGNOSTIC_CODE_DUPLICATE, DIAGNOSTIC_SOURCE } from './diagnostics';
+import {
+	DIAGNOSTIC_CODE,
+	DIAGNOSTIC_CODE_DUPLICATE,
+	DIAGNOSTIC_CODE_ULTRA_HIGH_RISK,
+	DIAGNOSTIC_SOURCE
+} from './diagnostics';
+
+const OUR_CODES: ReadonlySet<string> = new Set([
+	DIAGNOSTIC_CODE,
+	DIAGNOSTIC_CODE_DUPLICATE,
+	DIAGNOSTIC_CODE_ULTRA_HIGH_RISK
+]);
 
 /** Offers to insert the missing `private` keyword in front of the assignment. */
 export class AddPrivateQuickFix implements vscode.CodeActionProvider {
@@ -47,8 +58,5 @@ export class AddPrivateQuickFix implements vscode.CodeActionProvider {
 }
 
 function isOurDiagnostic(diagnostic: vscode.Diagnostic): boolean {
-	return (
-		diagnostic.source === DIAGNOSTIC_SOURCE &&
-		(diagnostic.code === DIAGNOSTIC_CODE || diagnostic.code === DIAGNOSTIC_CODE_DUPLICATE)
-	);
+	return diagnostic.source === DIAGNOSTIC_SOURCE && typeof diagnostic.code === 'string' && OUR_CODES.has(diagnostic.code);
 }

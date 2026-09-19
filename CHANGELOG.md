@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.0]
+
+- High-risk detection: a non-private local variable whose name is missing
+  `private` in *two or more* different files (not just one) is now reported with its
+  own, even stronger severity (`ultraHighRiskSeverity`, defaulting to `error`) than a
+  plain duplicate-name collision, since none of those occurrences has private scope
+  protecting it.
+
 ## [0.1.0]
 
 - Cross-file duplicate-name check: a non-private local variable whose name is also

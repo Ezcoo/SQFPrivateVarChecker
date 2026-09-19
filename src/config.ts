@@ -15,6 +15,13 @@ export interface CheckerConfig extends AnalyzerOptions {
 	flagDuplicateLocalNames: boolean;
 	/** Severity for a non-private variable whose name is also used in another file. */
 	duplicateNameSeverity: vscode.DiagnosticSeverity;
+	/**
+	 * Severity for a non-private variable whose name is missing `private` in two or
+	 * more different files -- none of those occurrences has its own scope, so they
+	 * can freely collide with each other. Stronger than a plain duplicate name, where
+	 * only one side is missing `private`.
+	 */
+	ultraHighRiskSeverity: vscode.DiagnosticSeverity;
 	/** Diagnostics less severe than this (e.g. Hint when this is Warning) are hidden. */
 	minimumSeverity: vscode.DiagnosticSeverity;
 	checkOnType: boolean;
@@ -30,6 +37,7 @@ export function readConfig(scope?: vscode.ConfigurationScope): CheckerConfig {
 		exclude: toExcludeGlob(exclude),
 		severity: toSeverity(config.get<string>('severity', 'warning')),
 		duplicateNameSeverity: toSeverity(config.get<string>('duplicateNameSeverity', 'error')),
+		ultraHighRiskSeverity: toSeverity(config.get<string>('ultraHighRiskSeverity', 'error')),
 		minimumSeverity: toSeverity(config.get<string>('minimumSeverity', 'hint')),
 		checkOnType: config.get<boolean>('checkOnType', true),
 		magicVariables: config.get<string[]>('magicVariables', []),

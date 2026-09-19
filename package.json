@@ -104,8 +104,19 @@
             "information",
             "hint"
           ],
-          "default": "error",
+          "default": "warning",
           "description": "Severity for a non-private local variable whose name is also used as a local variable in another file in the workspace."
+        },
+        "sqfPrivateVariableChecker.ultraHighRiskSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "default": "error",
+          "description": "Severity for a non-private local variable whose name is missing private in two or more different files in the workspace. Unlike duplicateNameSeverity (where only one side needs to be missing private), none of these occurrences has a private scope, so they might collide with each other."
         },
         "sqfPrivateVariableChecker.minimumSeverity": {
           "type": "string",

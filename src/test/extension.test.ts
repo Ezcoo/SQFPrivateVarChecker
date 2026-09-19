@@ -1,6 +1,6 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
-import { DIAGNOSTIC_SOURCE } from '../diagnostics';
+import { DIAGNOSTIC_CODE_ULTRA_HIGH_RISK, DIAGNOSTIC_SOURCE } from '../diagnostics';
 
 suite('extension', () => {
 	test('reports diagnostics for an open .sqf document', async () => {
@@ -41,6 +41,29 @@ suite('extension', () => {
 			assert.deepStrictEqual(diagnostics, []);
 		} finally {
 			await config.update('minimumSeverity', undefined, vscode.ConfigurationTarget.Global);
+		}
+	});
+
+	test('a name missing private in two files is flagged as ultra high risk', async () => {
+		// A name not used by any other test, since this needs to be missing
+		// private in *exactly* two open documents for the assertions below to hold.
+		const content = '_ultraRiskyShared = 1;\n';
+
+		const first = await vscode.workspace.openTextDocument({ language: 'sqf', content });
+		await vscode.window.showTextDocument(first);
+		const second = await vscode.workspace.openTextDocument({ language: 'sqf', content });
+		await vscode.window.showTextDocument(second);
+
+		const [firstDiagnostics, secondDiagnostics] = await Promise.all([
+			waitForDiagnostics(first.uri),
+			waitForDiagnostics(second.uri)
+		]);
+
+		for (const diagnostics of [firstDiagnostics, secondDiagnostics]) {
+			assert.strictEqual(diagnostics.length, 1);
+			assert.strictEqual(diagnostics[0].code, DIAGNOSTIC_CODE_ULTRA_HIGH_RISK);
+			assert.strictEqual(diagnostics[0].severity, vscode.DiagnosticSeverity.Error);
+			assert.ok(diagnostics[0].message.toLowerCase().includes('ultra high risk'));
 		}
 	});
 });

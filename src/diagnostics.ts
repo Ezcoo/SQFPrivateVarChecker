@@ -6,6 +6,7 @@ import { WorkspaceVariableIndex } from './workspaceIndex';
 export const DIAGNOSTIC_SOURCE = 'sqf-private';
 export const DIAGNOSTIC_CODE = 'missing-private';
 export const DIAGNOSTIC_CODE_DUPLICATE = 'duplicate-name';
+export const DIAGNOSTIC_CODE_ULTRA_HIGH_RISK = 'ultra-high-risk';
 
 export function isSqfDocument(document: vscode.TextDocument): boolean {
 	return document.languageId === 'sqf' || document.uri.path.toLowerCase().endsWith('.sqf');
@@ -85,7 +86,8 @@ export class SqfDiagnostics implements vscode.Disposable {
 		const allNames = config.flagDuplicateLocalNames
 			? new Set<string>([...result.privateNames, ...result.nonPrivateNames])
 			: new Set<string>();
-		const changedNames = this.index.update(key, allNames);
+		const nonPrivateNames = config.flagDuplicateLocalNames ? result.nonPrivateNames : new Set<string>();
+		const changedNames = this.index.update(key, allNames, nonPrivateNames);
 
 		const shown = this.emit(uri, config);
 
@@ -121,10 +123,12 @@ export class SqfDiagnostics implements vscode.Disposable {
 		const positionAt = createPositionMapper(state.text);
 		const diagnostics = state.issues
 			.map(issue => {
-				const otherFiles = config.flagDuplicateLocalNames
-					? this.index.otherFiles(issue.variable.toLowerCase(), key)
+				const lower = issue.variable.toLowerCase();
+				const otherFiles = config.flagDuplicateLocalNames ? this.index.otherFiles(lower, key) : [];
+				const otherNonPrivateFiles = config.flagDuplicateLocalNames
+					? this.index.otherNonPrivateFiles(lower, key)
 					: [];
-				return toDiagnostic(issue, toRange(positionAt, issue), config, otherFiles);
+				return toDiagnostic(issue, toRange(positionAt, issue), config, otherFiles, otherNonPrivateFiles);
 			})
 			// A severity numerically greater than minimumSeverity is less severe (Error=0 ... Hint=3).
 			.filter(diagnostic => diagnostic.severity <= config.minimumSeverity);
@@ -160,14 +164,35 @@ function toDiagnostic(
 	issue: SqfIssue,
 	range: vscode.Range,
 	config: CheckerConfig,
-	otherFiles: string[]
+	otherFiles: string[],
+	otherNonPrivateFiles: string[]
 ): vscode.Diagnostic {
-	const isDuplicate = otherFiles.length > 0;
-	const severity = isDuplicate ? config.duplicateNameSeverity : config.severity;
-	const message = isDuplicate ? duplicateNameMessage(issue.variable, otherFiles) : issue.message;
+	// otherNonPrivateFiles is a subset of otherFiles, so check it first: two or more
+	// files all missing private is strictly worse than one missing private while the
+	// other is safely declared, and only one diagnostic should be shown per issue.
+	const isUltraHighRisk = otherNonPrivateFiles.length > 0;
+	const isDuplicate = !isUltraHighRisk && otherFiles.length > 0;
+
+	let severity: vscode.DiagnosticSeverity;
+	let message: string;
+	let code: string;
+	if (isUltraHighRisk) {
+		severity = config.ultraHighRiskSeverity;
+		message = ultraHighRiskMessage(issue.variable, otherNonPrivateFiles);
+		code = DIAGNOSTIC_CODE_ULTRA_HIGH_RISK;
+	} else if (isDuplicate) {
+		severity = config.duplicateNameSeverity;
+		message = duplicateNameMessage(issue.variable, otherFiles);
+		code = DIAGNOSTIC_CODE_DUPLICATE;
+	} else {
+		severity = config.severity;
+		message = issue.message;
+		code = DIAGNOSTIC_CODE;
+	}
+
 	const diagnostic = new vscode.Diagnostic(range, message, severity);
 	diagnostic.source = DIAGNOSTIC_SOURCE;
-	diagnostic.code = isDuplicate ? DIAGNOSTIC_CODE_DUPLICATE : DIAGNOSTIC_CODE;
+	diagnostic.code = code;
 	return diagnostic;
 }
 
@@ -178,5 +203,16 @@ function duplicateNameMessage(variable: string, otherFileKeys: string[]): string
 	return (
 		`Local variable '${variable}' is assigned without being declared private, and the same name is also used ` +
 		`as a local variable in ${firstPath}${extra}.`
+	);
+}
+
+function ultraHighRiskMessage(variable: string, otherFileKeys: string[]): string {
+	const [firstKey, ...rest] = otherFileKeys;
+	const firstPath = vscode.workspace.asRelativePath(vscode.Uri.parse(firstKey));
+	const extra = rest.length > 0 ? ` and ${rest.length} other file${rest.length === 1 ? '' : 's'}` : '';
+	const siteCount = otherFileKeys.length + 1;
+	return (
+		`HIGH RISK: local variable '${variable}' is assigned without being declared private in at least ` +
+		`${siteCount} different places in the workspace, including this one and ${firstPath}${extra}.`
 	);
 }

@@ -4,14 +4,14 @@ import { WorkspaceVariableIndex } from '../workspaceIndex';
 suite('WorkspaceVariableIndex', () => {
 	test('a name used in only one file is not flagged as used elsewhere', () => {
 		const index = new WorkspaceVariableIndex();
-		index.update('file:///a.sqf', new Set(['_idx']));
+		index.update('file:///a.sqf', new Set(['_idx']), new Set());
 		assert.strictEqual(index.isUsedElsewhere('_idx', 'file:///a.sqf'), false);
 	});
 
 	test('a name reused by another file is flagged from both sides', () => {
 		const index = new WorkspaceVariableIndex();
-		index.update('file:///a.sqf', new Set(['_idx']));
-		index.update('file:///b.sqf', new Set(['_idx']));
+		index.update('file:///a.sqf', new Set(['_idx']), new Set());
+		index.update('file:///b.sqf', new Set(['_idx']), new Set());
 
 		assert.strictEqual(index.isUsedElsewhere('_idx', 'file:///a.sqf'), true);
 		assert.strictEqual(index.isUsedElsewhere('_idx', 'file:///b.sqf'), true);
@@ -20,16 +20,16 @@ suite('WorkspaceVariableIndex', () => {
 
 	test('reusing the same name twice within one file does not count as "elsewhere"', () => {
 		const index = new WorkspaceVariableIndex();
-		index.update('file:///a.sqf', new Set(['_idx']));
+		index.update('file:///a.sqf', new Set(['_idx']), new Set());
 		assert.strictEqual(index.isUsedElsewhere('_idx', 'file:///a.sqf'), false);
 	});
 
 	test('a later update replaces what was previously known about a file', () => {
 		const index = new WorkspaceVariableIndex();
-		index.update('file:///a.sqf', new Set(['_idx']));
-		index.update('file:///b.sqf', new Set(['_idx']));
+		index.update('file:///a.sqf', new Set(['_idx']), new Set());
+		index.update('file:///b.sqf', new Set(['_idx']), new Set());
 		// a.sqf no longer declares _idx at all.
-		index.update('file:///a.sqf', new Set(['_other']));
+		index.update('file:///a.sqf', new Set(['_other']), new Set());
 
 		assert.strictEqual(index.isUsedElsewhere('_idx', 'file:///b.sqf'), false);
 		assert.strictEqual(index.isUsedElsewhere('_other', 'file:///a.sqf'), false);
@@ -37,8 +37,8 @@ suite('WorkspaceVariableIndex', () => {
 
 	test('remove() forgets a file entirely', () => {
 		const index = new WorkspaceVariableIndex();
-		index.update('file:///a.sqf', new Set(['_idx']));
-		index.update('file:///b.sqf', new Set(['_idx']));
+		index.update('file:///a.sqf', new Set(['_idx']), new Set());
+		index.update('file:///b.sqf', new Set(['_idx']), new Set());
 		index.remove('file:///b.sqf');
 
 		assert.strictEqual(index.isUsedElsewhere('_idx', 'file:///a.sqf'), false);
@@ -46,18 +46,49 @@ suite('WorkspaceVariableIndex', () => {
 
 	test('update() reports which names changed cross-file membership', () => {
 		const index = new WorkspaceVariableIndex();
-		index.update('file:///a.sqf', new Set(['_idx', '_stable']));
-		const changed = index.update('file:///b.sqf', new Set(['_idx']));
+		index.update('file:///a.sqf', new Set(['_idx', '_stable']), new Set());
+		const changed = index.update('file:///b.sqf', new Set(['_idx']), new Set());
 		assert.deepStrictEqual([...changed], ['_idx']);
 	});
 
 	test('clear() forgets every file', () => {
 		const index = new WorkspaceVariableIndex();
-		index.update('file:///a.sqf', new Set(['_idx']));
-		index.update('file:///b.sqf', new Set(['_idx']));
+		index.update('file:///a.sqf', new Set(['_idx']), new Set());
+		index.update('file:///b.sqf', new Set(['_idx']), new Set());
 		index.clear();
 
 		assert.strictEqual(index.isUsedElsewhere('_idx', 'file:///a.sqf'), false);
 		assert.strictEqual(index.isUsedElsewhere('_idx', 'file:///b.sqf'), false);
+	});
+
+	suite('otherNonPrivateFiles (ultra high risk)', () => {
+		test('one file missing private, another declaring it private: not ultra high risk', () => {
+			const index = new WorkspaceVariableIndex();
+			index.update('file:///a.sqf', new Set(['_idx']), new Set(['_idx']));
+			index.update('file:///b.sqf', new Set(['_idx']), new Set());
+
+			assert.deepStrictEqual(index.otherNonPrivateFiles('_idx', 'file:///a.sqf'), []);
+			assert.deepStrictEqual(index.otherFiles('_idx', 'file:///a.sqf'), ['file:///b.sqf']);
+		});
+
+		test('two files both missing private: ultra high risk from both sides', () => {
+			const index = new WorkspaceVariableIndex();
+			index.update('file:///a.sqf', new Set(['_idx']), new Set(['_idx']));
+			index.update('file:///b.sqf', new Set(['_idx']), new Set(['_idx']));
+
+			assert.deepStrictEqual(index.otherNonPrivateFiles('_idx', 'file:///a.sqf'), ['file:///b.sqf']);
+			assert.deepStrictEqual(index.otherNonPrivateFiles('_idx', 'file:///b.sqf'), ['file:///a.sqf']);
+		});
+
+		test('a file fixing its own missing-private declaration drops out of the risky set', () => {
+			const index = new WorkspaceVariableIndex();
+			index.update('file:///a.sqf', new Set(['_idx']), new Set(['_idx']));
+			index.update('file:///b.sqf', new Set(['_idx']), new Set(['_idx']));
+			// b.sqf adds "private" -- still uses the name, but no longer non-private.
+			index.update('file:///b.sqf', new Set(['_idx']), new Set());
+
+			assert.deepStrictEqual(index.otherNonPrivateFiles('_idx', 'file:///a.sqf'), []);
+			assert.deepStrictEqual(index.otherFiles('_idx', 'file:///a.sqf'), ['file:///b.sqf']);
+		});
 	});
 });
