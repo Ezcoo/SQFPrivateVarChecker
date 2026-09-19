@@ -64,7 +64,7 @@
           "default": true,
           "description": "Enable checking of .sqf files for local variables that are assigned without being declared private."
         },
-        "sqfPrivateVariableChecker.include"Add cross reference check for non-private local vars (w/ high s: {
+        "sqfPrivateVariableChecker.include": {
           "type": "string",
           "default": "**/*.sqf",
           "description": "Glob pattern for the files included in a workspace scan."
