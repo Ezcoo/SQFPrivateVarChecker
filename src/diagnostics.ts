@@ -1,16 +1,28 @@
 import * as vscode from 'vscode';
-import { analyze, createPositionMapper, SqfIssue } from './analyzer/analyzer';
+import { analyzeFile, createPositionMapper, SqfIssue } from './analyzer/analyzer';
 import { CheckerConfig, readConfig } from './config';
+import { WorkspaceVariableIndex } from './workspaceIndex';
 
 export const DIAGNOSTIC_SOURCE = 'sqf-private';
 export const DIAGNOSTIC_CODE = 'missing-private';
+export const DIAGNOSTIC_CODE_DUPLICATE = 'duplicate-name';
 
 export function isSqfDocument(document: vscode.TextDocument): boolean {
 	return document.languageId === 'sqf' || document.uri.path.toLowerCase().endsWith('.sqf');
 }
 
+interface FileState {
+	text: string;
+	issues: SqfIssue[];
+	/** Local variable names (lowercased) that have a `missing-private` issue in this file. */
+	nonPrivateNames: Set<string>;
+}
+
 export class SqfDiagnostics implements vscode.Disposable {
 	private readonly collection: vscode.DiagnosticCollection;
+	/** Which local variable names every scanned file uses, to power the cross-file check. */
+	private readonly index = new WorkspaceVariableIndex();
+	private readonly files = new Map<string, FileState>();
 
 	constructor() {
 		this.collection = vscode.languages.createDiagnosticCollection('sqf-private-variables');
@@ -22,10 +34,12 @@ export class SqfDiagnostics implements vscode.Disposable {
 
 	clear(): void {
 		this.collection.clear();
+		this.files.clear();
+		this.index.clear();
 	}
 
 	delete(uri: vscode.Uri): void {
-		this.collection.delete(uri);
+		this.forget(uri);
 	}
 
 	/** Re-checks an open document. Returns the number of issues found. */
@@ -36,26 +50,20 @@ export class SqfDiagnostics implements vscode.Disposable {
 
 		const config = readConfig(document.uri);
 		if (!config.enable) {
-			this.collection.delete(document.uri);
+			this.forget(document.uri);
 			return 0;
 		}
 
-		const issues = analyze(document.getText(), config);
-		this.collection.set(
-			document.uri,
-			issues.map(issue =>
-				toDiagnostic(
-					issue,
-					new vscode.Range(document.positionAt(issue.start), document.positionAt(issue.end)),
-					config.severity
-				)
-			)
-		);
-		return issues.length;
+		return this.check(document.uri, document.getText(), config);
 	}
 
 	/** Checks a file on disk without opening it as a document. */
 	async refreshFile(uri: vscode.Uri, config: CheckerConfig): Promise<number> {
+		if (!config.enable) {
+			this.forget(uri);
+			return 0;
+		}
+
 		const openDocument = vscode.workspace.textDocuments.find(
 			document => document.uri.toString() === uri.toString()
 		);
@@ -64,33 +72,111 @@ export class SqfDiagnostics implements vscode.Disposable {
 			? openDocument.getText()
 			: new TextDecoder().decode(await vscode.workspace.fs.readFile(uri));
 
-		const issues = analyze(text, config);
-		if (issues.length === 0) {
+		return this.check(uri, text, config);
+	}
+
+	private check(uri: vscode.Uri, text: string, config: CheckerConfig): number {
+		const key = uri.toString();
+		const result = analyzeFile(text, config);
+		this.files.set(key, { text, issues: result.issues, nonPrivateNames: result.nonPrivateNames });
+
+		// Files with the cross-file check turned off do not contribute their names to
+		// the index, so other files cannot collide with them either.
+		const allNames = config.flagDuplicateLocalNames
+			? new Set<string>([...result.privateNames, ...result.nonPrivateNames])
+			: new Set<string>();
+		const changedNames = this.index.update(key, allNames);
+
+		const shown = this.emit(uri, config);
+
+		if (config.flagDuplicateLocalNames) {
+			// A name this file just introduced (or dropped) may change whether some
+			// other, already-checked file counts as a duplicate.
+			this.recheckAffected(changedNames, key);
+		}
+
+		return shown;
+	}
+
+	private forget(uri: vscode.Uri): void {
+		const key = uri.toString();
+		this.collection.delete(uri);
+		this.files.delete(key);
+		const changedNames = this.index.remove(key);
+		this.recheckAffected(changedNames, key);
+	}
+
+	/**
+	 * Rebuilds diagnostics for `uri` from its cached analysis, against the current
+	 * index and the current `minimumSeverity` filter. Returns how many are shown.
+	 */
+	private emit(uri: vscode.Uri, config: CheckerConfig): number {
+		const key = uri.toString();
+		const state = this.files.get(key);
+		if (!state || state.issues.length === 0) {
 			this.collection.delete(uri);
 			return 0;
 		}
 
-		const positionAt = createPositionMapper(text);
-		this.collection.set(
-			uri,
-			issues.map(issue => {
-				const start = positionAt(issue.start);
-				const end = positionAt(issue.end);
-				const range = new vscode.Range(start.line, start.character, end.line, end.character);
-				return toDiagnostic(issue, range, config.severity);
+		const positionAt = createPositionMapper(state.text);
+		const diagnostics = state.issues
+			.map(issue => {
+				const otherFiles = config.flagDuplicateLocalNames
+					? this.index.otherFiles(issue.variable.toLowerCase(), key)
+					: [];
+				return toDiagnostic(issue, toRange(positionAt, issue), config, otherFiles);
 			})
-		);
-		return issues.length;
+			// A severity numerically greater than minimumSeverity is less severe (Error=0 ... Hint=3).
+			.filter(diagnostic => diagnostic.severity <= config.minimumSeverity);
+		this.collection.set(uri, diagnostics);
+		return diagnostics.length;
 	}
+
+	/** Re-emits diagnostics (no re-parsing) for every already-checked file that uses one of `changedNames`. */
+	private recheckAffected(changedNames: Set<string>, excludeKey: string): void {
+		if (changedNames.size === 0) {
+			return;
+		}
+		for (const [key, state] of this.files) {
+			if (key === excludeKey) {
+				continue;
+			}
+			const affected = [...state.nonPrivateNames].some(name => changedNames.has(name));
+			if (affected) {
+				const uri = vscode.Uri.parse(key);
+				this.emit(uri, readConfig(uri));
+			}
+		}
+	}
+}
+
+function toRange(positionAt: (offset: number) => { line: number; character: number }, issue: SqfIssue): vscode.Range {
+	const start = positionAt(issue.start);
+	const end = positionAt(issue.end);
+	return new vscode.Range(start.line, start.character, end.line, end.character);
 }
 
 function toDiagnostic(
 	issue: SqfIssue,
 	range: vscode.Range,
-	severity: vscode.DiagnosticSeverity
+	config: CheckerConfig,
+	otherFiles: string[]
 ): vscode.Diagnostic {
-	const diagnostic = new vscode.Diagnostic(range, issue.message, severity);
+	const isDuplicate = otherFiles.length > 0;
+	const severity = isDuplicate ? config.duplicateNameSeverity : config.severity;
+	const message = isDuplicate ? duplicateNameMessage(issue.variable, otherFiles) : issue.message;
+	const diagnostic = new vscode.Diagnostic(range, message, severity);
 	diagnostic.source = DIAGNOSTIC_SOURCE;
-	diagnostic.code = DIAGNOSTIC_CODE;
+	diagnostic.code = isDuplicate ? DIAGNOSTIC_CODE_DUPLICATE : DIAGNOSTIC_CODE;
 	return diagnostic;
+}
+
+function duplicateNameMessage(variable: string, otherFileKeys: string[]): string {
+	const [firstKey, ...rest] = otherFileKeys;
+	const firstPath = vscode.workspace.asRelativePath(vscode.Uri.parse(firstKey));
+	const extra = rest.length > 0 ? ` and ${rest.length} other file${rest.length === 1 ? '' : 's'}` : '';
+	return (
+		`Local variable '${variable}' is assigned without being declared private, and the same name is also used ` +
+		`as a local variable in ${firstPath}${extra}.`
+	);
 }

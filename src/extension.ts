@@ -51,13 +51,24 @@ export function activate(context: vscode.ExtensionContext) {
 			if (event.affectsConfiguration(CONFIG_SECTION)) {
 				diagnostics.clear();
 				refreshAllOpenDocuments();
+				void indexWorkspaceQuietly(diagnostics);
 			}
 		})
 	);
 
+	// The cross-file duplicate-name check needs every file's local variable names,
+	// not just the ones currently open, so keep files that are only touched on disk
+	// (created, edited outside VS Code, or already present at startup) in the index too.
 	const watcher = vscode.workspace.createFileSystemWatcher('**/*.sqf');
 	context.subscriptions.push(
 		watcher,
+		watcher.onDidCreate(uri => void diagnostics.refreshFile(uri, readConfig(uri))),
+		watcher.onDidChange(uri => {
+			// Open documents are already re-checked by onDidChangeTextDocument/onDidSaveTextDocument.
+			if (!vscode.workspace.textDocuments.some(document => document.uri.toString() === uri.toString())) {
+				void diagnostics.refreshFile(uri, readConfig(uri));
+			}
+		}),
 		watcher.onDidDelete(uri => diagnostics.delete(uri))
 	);
 
@@ -90,6 +101,39 @@ export function activate(context: vscode.ExtensionContext) {
 	);
 
 	refreshAllOpenDocuments();
+	void indexWorkspaceQuietly(diagnostics);
+}
+
+/**
+ * Scans every matching file in the background so the cross-file duplicate-name check
+ * (`flagDuplicateLocalNames`) has something to compare against from the start, rather
+ * than only ever seeing files the user happens to open. Silent by design: unlike
+ * `SQF: Check Workspace`, this is not a user-initiated action.
+ */
+async function indexWorkspaceQuietly(diagnostics: SqfDiagnostics): Promise<void> {
+	if (!vscode.workspace.workspaceFolders?.length) {
+		return;
+	}
+
+	const config = readConfig();
+	if (!config.enable || !config.flagDuplicateLocalNames) {
+		return;
+	}
+
+	let files: vscode.Uri[];
+	try {
+		files = await vscode.workspace.findFiles(config.include, config.exclude ?? undefined);
+	} catch {
+		return;
+	}
+
+	for (const uri of files) {
+		try {
+			await diagnostics.refreshFile(uri, config);
+		} catch {
+			// Best-effort background indexing; one unreadable file should not stop the rest.
+		}
+	}
 }
 
 async function checkWorkspace(diagnostics: SqfDiagnostics, output: vscode.OutputChannel): Promise<void> {

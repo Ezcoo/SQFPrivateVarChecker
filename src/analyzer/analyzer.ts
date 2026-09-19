@@ -8,6 +8,13 @@ export interface SqfIssue {
 	/** Offset just past the last character of the variable. */
 	end: number;
 	message: string;
+	/**
+	 * `missing-private` is what this analyzer produces on its own. `duplicate-name`
+	 * is assigned afterwards, by code outside this file, when the same variable name
+	 * is also used as a local variable in a *different* file in the workspace — the
+	 * analyzer only ever looks at one file, so it cannot know that by itself.
+	 */
+	kind: 'missing-private' | 'duplicate-name';
 }
 
 export interface AnalyzerOptions {
@@ -17,6 +24,20 @@ export interface AnalyzerOptions {
 	treatParamsAsPrivate?: boolean;
 	/** Treat `for "_i" from ...` as a private declaration. Defaults to true. */
 	treatForLoopVariablesAsPrivate?: boolean;
+}
+
+export interface AnalyzeResult {
+	issues: SqfIssue[];
+	/** Local variable names (lowercased) declared `private` somewhere in the file. */
+	privateNames: Set<string>;
+	/** Local variable names (lowercased) that have a `missing-private` issue in the file. */
+	nonPrivateNames: Set<string>;
+}
+
+/** One place in the file where a name first becomes a local variable in some scope. */
+interface NameOccurrence {
+	name: string;
+	isPrivate: boolean;
 }
 
 /**
@@ -42,6 +63,10 @@ export const DEFAULT_MAGIC_VARIABLES = [
 ];
 
 export function analyze(text: string, options: AnalyzerOptions = {}): SqfIssue[] {
+	return analyzeFile(text, options).issues;
+}
+
+export function analyzeFile(text: string, options: AnalyzerOptions = {}): AnalyzeResult {
 	const tokens = tokenize(text);
 	const magic = new Set(
 		[...DEFAULT_MAGIC_VARIABLES, ...(options.magicVariables ?? [])].map(name => name.toLowerCase())
@@ -51,7 +76,21 @@ export function analyze(text: string, options: AnalyzerOptions = {}): SqfIssue[]
 
 	// SQF variable names are case insensitive, so every lookup is lowercased.
 	const scopes: Set<string>[] = [new Set<string>()];
-	const declare = (name: string) => scopes[scopes.length - 1].add(name.toLowerCase());
+	const occurrences: NameOccurrence[] = [];
+
+	const markDeclared = (name: string) => scopes[scopes.length - 1].add(name.toLowerCase());
+
+	// Used for `private`/`params`/`for` declarations. Only the first time a scope
+	// sees a name counts as an "occurrence" of that local variable, so redundantly
+	// re-declaring it is not recorded twice.
+	const declare = (name: string) => {
+		const lower = name.toLowerCase();
+		const scope = scopes[scopes.length - 1];
+		if (!scope.has(lower)) {
+			scope.add(lower);
+			occurrences.push({ name, isPrivate: true });
+		}
+	};
 	const isDeclared = (name: string) => {
 		const lower = name.toLowerCase();
 		return scopes.some(scope => scope.has(lower));
@@ -110,15 +149,28 @@ export function analyze(text: string, options: AnalyzerOptions = {}): SqfIssue[]
 				variable: token.value,
 				start: token.start,
 				end: token.end,
-				message: `Local variable '${token.value}' is assigned without being declared private.`
+				message: `Local variable '${token.value}' is assigned without being declared private.`,
+				kind: 'missing-private'
 			});
 			// Record it so the same variable is reported once per scope rather
 			// than on every following assignment.
-			declare(token.value);
+			markDeclared(token.value);
+			occurrences.push({ name: token.value, isPrivate: false });
 		}
 	}
 
-	return issues;
+	const privateNames = new Set<string>();
+	const nonPrivateNames = new Set<string>();
+	for (const occurrence of occurrences) {
+		const lower = occurrence.name.toLowerCase();
+		if (occurrence.isPrivate) {
+			privateNames.add(lower);
+		} else {
+			nonPrivateNames.add(lower);
+		}
+	}
+
+	return { issues, privateNames, nonPrivateNames };
 }
 
 /**

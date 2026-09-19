@@ -22,6 +22,27 @@ suite('extension', () => {
 		assert.ok(commands.includes('sqf-private-variable-checker.checkWorkspace'));
 		assert.ok(commands.includes('sqf-private-variable-checker.checkFile'));
 	});
+
+	test('minimumSeverity hides diagnostics less severe than it', async () => {
+		const config = vscode.workspace.getConfiguration('sqfPrivateVariableChecker');
+		await config.update('minimumSeverity', 'error', vscode.ConfigurationTarget.Global);
+		try {
+			const document = await vscode.workspace.openTextDocument({
+				language: 'sqf',
+				// A name not used by any other test, so this stays a plain
+				// "missing-private" warning rather than a cross-file "duplicate-name" error.
+				content: '_minSeverityOnly = 2;\n'
+			});
+			await vscode.window.showTextDocument(document);
+
+			// Give the checker a moment to run, then confirm nothing below "error" shows up.
+			await new Promise(resolve => setTimeout(resolve, 500));
+			const diagnostics = vscode.languages.getDiagnostics(document.uri).filter(d => d.source === DIAGNOSTIC_SOURCE);
+			assert.deepStrictEqual(diagnostics, []);
+		} finally {
+			await config.update('minimumSeverity', undefined, vscode.ConfigurationTarget.Global);
+		}
+	});
 });
 
 async function waitForDiagnostics(uri: vscode.Uri, timeoutMs = 5000): Promise<vscode.Diagnostic[]> {

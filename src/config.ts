@@ -8,6 +8,15 @@ export interface CheckerConfig extends AnalyzerOptions {
 	include: string;
 	exclude: string | null;
 	severity: vscode.DiagnosticSeverity;
+	/**
+	 * Cross-check non-private variables against every other .sqf file in the
+	 * workspace, not just the current file.
+	 */
+	flagDuplicateLocalNames: boolean;
+	/** Severity for a non-private variable whose name is also used in another file. */
+	duplicateNameSeverity: vscode.DiagnosticSeverity;
+	/** Diagnostics less severe than this (e.g. Hint when this is Warning) are hidden. */
+	minimumSeverity: vscode.DiagnosticSeverity;
 	checkOnType: boolean;
 }
 
@@ -20,10 +29,13 @@ export function readConfig(scope?: vscode.ConfigurationScope): CheckerConfig {
 		include: config.get<string>('include', '**/*.sqf'),
 		exclude: toExcludeGlob(exclude),
 		severity: toSeverity(config.get<string>('severity', 'warning')),
+		duplicateNameSeverity: toSeverity(config.get<string>('duplicateNameSeverity', 'error')),
+		minimumSeverity: toSeverity(config.get<string>('minimumSeverity', 'hint')),
 		checkOnType: config.get<boolean>('checkOnType', true),
 		magicVariables: config.get<string[]>('magicVariables', []),
 		treatParamsAsPrivate: config.get<boolean>('treatParamsAsPrivate', true),
-		treatForLoopVariablesAsPrivate: config.get<boolean>('treatForLoopVariablesAsPrivate', true)
+		treatForLoopVariablesAsPrivate: config.get<boolean>('treatForLoopVariablesAsPrivate', true),
+		flagDuplicateLocalNames: config.get<boolean>('flagDuplicateLocalNames', true)
 	};
 }
 

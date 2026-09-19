@@ -91,6 +91,39 @@
           "default": "warning",
           "description": "Severity reported in the Problems panel."
         },
+        "sqfPrivateVariableChecker.flagDuplicateLocalNames": {
+          "type": "boolean",
+          "default": true,
+          "description": "Cross-check non-private local variables against every other .sqf file in the workspace, not just the current file. If a name used in this file without private is also used as a local variable in a different file, report it separately using duplicateNameSeverity. Variables reused within the same file are not affected."
+        },
+        "sqfPrivateVariableChecker.duplicateNameSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "default": "error",
+          "description": "Severity for a non-private local variable whose name is also used as a local variable in another file in the workspace."
+        },
+        "sqfPrivateVariableChecker.minimumSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "enumDescriptions": [
+            "Errors only.",
+            "Warnings and errors.",
+            "Information messages, warnings and errors.",
+            "Everything, including hints (default)."
+          ],
+          "default": "hint",
+          "description": "Hide diagnostics less severe than this, in both the Problems panel and workspace scan summaries. Combine with severity/duplicateNameSeverity to, for example, show missing-private as a warning but only ever surface duplicate-name errors."
+        },
         "sqfPrivateVariableChecker.checkOnType": {
           "type": "boolean",
           "default": true,

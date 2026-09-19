@@ -1,5 +1,5 @@
 import * as assert from 'assert';
-import { analyze } from '../analyzer/analyzer';
+import { analyze, analyzeFile } from '../analyzer/analyzer';
 import { tokenize } from '../analyzer/tokenizer';
 
 function names(source: string): string[] {
@@ -94,5 +94,42 @@ suite('analyzer', () => {
 	test('honours extra magic variables', () => {
 		const issues = analyze('_fnc_custom = {};', { magicVariables: ['_fnc_custom'] });
 		assert.deepStrictEqual(issues, []);
+	});
+
+	test('every issue from analyze() is a plain missing-private issue', () => {
+		// analyze() only ever looks at one file, so it cannot know about duplicate
+		// names in other files -- that is decided one layer up, from analyzeFile().
+		const issues = analyze('if (a) then { _idx = 1; };\nif (b) then { _idx = 2; };');
+		assert.ok(issues.every(issue => issue.kind === 'missing-private'));
+	});
+});
+
+suite('analyzeFile - private/non-private name sets', () => {
+	test('collects declared-private names regardless of form', () => {
+		const result = analyzeFile(
+			'private _a = 1;\nparams ["_b"];\nfor "_c" from 0 to 1 do {};'
+		);
+		assert.deepStrictEqual([...result.privateNames].sort(), ['_a', '_b', '_c']);
+		assert.deepStrictEqual([...result.nonPrivateNames], []);
+	});
+
+	test('collects missing-private names', () => {
+		const result = analyzeFile('_bad = 1;');
+		assert.deepStrictEqual([...result.nonPrivateNames], ['_bad']);
+		assert.deepStrictEqual([...result.privateNames], []);
+	});
+
+	test('a name can be both private and non-private in the same file', () => {
+		// Two unrelated scopes: one declares it private, the other forgets to.
+		// Whether that is worth flagging is a cross-file decision, not analyzeFile's.
+		const result = analyzeFile('if (a) then { private _idx = 1; };\nif (b) then { _idx = 2; };');
+		assert.ok(result.privateNames.has('_idx'));
+		assert.ok(result.nonPrivateNames.has('_idx'));
+	});
+
+	test('name sets are lowercased', () => {
+		const result = analyzeFile('private _A = 1;\n_B = 2;');
+		assert.ok(result.privateNames.has('_a'));
+		assert.ok(result.nonPrivateNames.has('_b'));
 	});
 });

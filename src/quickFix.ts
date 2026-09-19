@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { DIAGNOSTIC_CODE, DIAGNOSTIC_SOURCE } from './diagnostics';
+import { DIAGNOSTIC_CODE, DIAGNOSTIC_CODE_DUPLICATE, DIAGNOSTIC_SOURCE } from './diagnostics';
 
 /** Offers to insert the missing `private` keyword in front of the assignment. */
 export class AddPrivateQuickFix implements vscode.CodeActionProvider {
@@ -47,5 +47,8 @@ export class AddPrivateQuickFix implements vscode.CodeActionProvider {
 }
 
 function isOurDiagnostic(diagnostic: vscode.Diagnostic): boolean {
-	return diagnostic.source === DIAGNOSTIC_SOURCE && diagnostic.code === DIAGNOSTIC_CODE;
+	return (
+		diagnostic.source === DIAGNOSTIC_SOURCE &&
+		(diagnostic.code === DIAGNOSTIC_CODE || diagnostic.code === DIAGNOSTIC_CODE_DUPLICATE)
+	);
 }
