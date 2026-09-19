@@ -3,7 +3,7 @@
   "displayName": "SQF Private Variable Checker",
   "publisher": "Ezcoo",
   "description": "Checks all local variables and informs the user if there are non-private local vars.",
-  "version": "0.0.2",
+  "version": "0.1.0",
   "icon": "resources/icon.png",
   "repository": {
     "type": "git",
@@ -64,7 +64,7 @@
           "default": true,
           "description": "Enable checking of .sqf files for local variables that are assigned without being declared private."
         },
-        "sqfPrivateVariableChecker.include": {
+        "sqfPrivateVariableChecker.include"Add cross reference check for non-private local vars (w/ high s: {
           "type": "string",
           "default": "**/*.sqf",
           "description": "Glob pattern for the files included in a workspace scan."
