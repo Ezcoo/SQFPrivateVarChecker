@@ -2,14 +2,17 @@ import * as vscode from 'vscode';
 import {
 	DIAGNOSTIC_CODE,
 	DIAGNOSTIC_CODE_DUPLICATE,
-	DIAGNOSTIC_CODE_ULTRA_HIGH_RISK,
+	DIAGNOSTIC_CODE_SCOPE_LEAK,
+	DIAGNOSTIC_CODE_HIGH_RISK,
 	DIAGNOSTIC_SOURCE
 } from './diagnostics';
 
+/** Diagnostics sitting on an assignment, where inserting `private` fixes them. */
 const OUR_CODES: ReadonlySet<string> = new Set([
 	DIAGNOSTIC_CODE,
 	DIAGNOSTIC_CODE_DUPLICATE,
-	DIAGNOSTIC_CODE_ULTRA_HIGH_RISK
+	DIAGNOSTIC_CODE_HIGH_RISK,
+	DIAGNOSTIC_CODE_SCOPE_LEAK
 ]);
 
 /** Offers to insert the missing `private` keyword in front of the assignment. */

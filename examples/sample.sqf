@@ -1,12 +1,12 @@
 /*
  * Scratch file for trying the checker out.
  * Expected once only this file is open: _speed, _nearby and _index are all
- * reported as plain missing-private warnings.
+ * reported as plain missing-private diagnostics (information by default).
  * Once examples/sample2.sqf and examples/sample3.sqf are also scanned (open both,
  * or run "SQF: Check Workspace"):
- *  - _index becomes a duplicate-name collision (error by default): sample2.sqf
+ *  - _index becomes a duplicate-name collision (information by default): sample2.sqf
  *    uses the same name, but declares it private there.
- *  - _speed becomes ultra high risk (error by default, and more severe than a
+ *  - _speed becomes high risk (warning by default, but a stronger hint than a
  *    plain duplicate-name): sample3.sqf uses the same name *without* private too,
  *    so neither occurrence has any scope protecting it from the other.
  */

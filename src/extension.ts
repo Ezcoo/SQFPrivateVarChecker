@@ -1,9 +1,11 @@
 import * as vscode from 'vscode';
 import { CONFIG_SECTION, readConfig } from './config';
-import { isSqfDocument, SqfDiagnostics } from './diagnostics';
+import { isFunctionConfigFile, isSqfDocument, SqfDiagnostics } from './diagnostics';
 import { AddPrivateQuickFix } from './quickFix';
 
 const DEBOUNCE_MS = 300;
+/** Candidates for `description.ext` and `CfgFunctions.hpp`; filtered by `isFunctionConfigFile`. */
+const FUNCTION_CONFIG_GLOB = '**/*.{ext,hpp,EXT,HPP}';
 
 export function activate(context: vscode.ExtensionContext) {
 	const diagnostics = new SqfDiagnostics();
@@ -72,6 +74,20 @@ export function activate(context: vscode.ExtensionContext) {
 		watcher.onDidDelete(uri => diagnostics.delete(uri))
 	);
 
+	// Functions declared in CfgFunctions, for following `call` chains across files.
+	const configWatcher = vscode.workspace.createFileSystemWatcher(FUNCTION_CONFIG_GLOB);
+	const refreshConfig = (uri: vscode.Uri) => {
+		if (isFunctionConfigFile(uri)) {
+			diagnostics.refreshFunctionConfig(uri).catch(() => diagnostics.deleteFunctionConfig(uri));
+		}
+	};
+	context.subscriptions.push(
+		configWatcher,
+		configWatcher.onDidCreate(refreshConfig),
+		configWatcher.onDidChange(refreshConfig),
+		configWatcher.onDidDelete(uri => diagnostics.deleteFunctionConfig(uri))
+	);
+
 	context.subscriptions.push(
 		vscode.languages.registerCodeActionsProvider(
 			[{ language: 'sqf' }, { pattern: '**/*.sqf' }],
@@ -90,7 +106,9 @@ export function activate(context: vscode.ExtensionContext) {
 				vscode.window.showInformationMessage('The active editor is not an .sqf file.');
 				return;
 			}
-			const count = diagnostics.refreshDocument(editor.document);
+			diagnostics.refreshDocument(editor.document);
+			diagnostics.flushScopeLeaks();
+			const count = diagnostics.shownCount(editor.document.uri);
 			vscode.window.showInformationMessage(
 				count === 0
 					? 'No non-private local variables found in this file.'
@@ -102,6 +120,54 @@ export function activate(context: vscode.ExtensionContext) {
 
 	refreshAllOpenDocuments();
 	void indexWorkspaceQuietly(diagnostics);
+	// After the configuration listener above, so a reset re-checks everything.
+	void resetMinimumSeverityOnce(context);
+}
+
+/** Bump the suffix to run the reset again in some future release. */
+const MINIMUM_SEVERITY_RESET_KEY = 'minimumSeverityReset.v1';
+const MINIMUM_SEVERITY_DEFAULT = 'information';
+
+/**
+ * One-time migration: `minimumSeverity` now defaults to `information`, and every check
+ * defaults to at least that, so an older explicit value (e.g. `warning`) would hide
+ * them. Removes an explicit value other than `information` from the user settings,
+ * once per install, so the default applies. Workspace and folder settings are project
+ * files, possibly under version control, so they are left alone; so are later changes,
+ * since the reset is remembered.
+ */
+export async function resetMinimumSeverityOnce(context: vscode.ExtensionContext): Promise<void> {
+	if (context.globalState.get(MINIMUM_SEVERITY_RESET_KEY)) {
+		return;
+	}
+	await context.globalState.update(MINIMUM_SEVERITY_RESET_KEY, true);
+
+	const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+	const previous = config.inspect<string>('minimumSeverity')?.globalValue;
+	if (previous === undefined || previous === MINIMUM_SEVERITY_DEFAULT) {
+		return;
+	}
+	try {
+		await config.update('minimumSeverity', undefined, vscode.ConfigurationTarget.Global);
+	} catch {
+		return; // Settings that cannot be written are left as they are.
+	}
+	vscode.window.showInformationMessage(
+		`SQF Private Variable Checker: ${CONFIG_SECTION}.minimumSeverity was reset from '${previous}' to its ` +
+			`new default '${MINIMUM_SEVERITY_DEFAULT}' in your user settings, so no checks are hidden.`
+	);
+}
+
+/** Reads every `description.ext` and `CfgFunctions.hpp` in the workspace. */
+async function indexFunctionConfigs(diagnostics: SqfDiagnostics, exclude: string | null): Promise<void> {
+	const files = await vscode.workspace.findFiles(FUNCTION_CONFIG_GLOB, exclude ?? undefined);
+	for (const uri of files.filter(isFunctionConfigFile)) {
+		try {
+			await diagnostics.refreshFunctionConfig(uri);
+		} catch {
+			// An unreadable config only means fewer functions can be followed.
+		}
+	}
 }
 
 /**
@@ -116,12 +182,13 @@ async function indexWorkspaceQuietly(diagnostics: SqfDiagnostics): Promise<void>
 	}
 
 	const config = readConfig();
-	if (!config.enable || !config.flagDuplicateLocalNames) {
+	if (!config.enable || (!config.flagDuplicateLocalNames && !config.detectScopeLeaks)) {
 		return;
 	}
 
 	let files: vscode.Uri[];
 	try {
+		await indexFunctionConfigs(diagnostics, config.exclude);
 		files = await vscode.workspace.findFiles(config.include, config.exclude ?? undefined);
 	} catch {
 		return;
@@ -172,18 +239,33 @@ async function checkWorkspace(diagnostics: SqfDiagnostics, output: vscode.Output
 			let fileCount = 0;
 			let checked = 0;
 
+			await indexFunctionConfigs(diagnostics, config.exclude);
+
+			const scanned: vscode.Uri[] = [];
 			for (const uri of files) {
 				if (token.isCancellationRequested) {
 					break;
 				}
 
-				let found = 0;
 				try {
-					found = await diagnostics.refreshFile(uri, config);
+					await diagnostics.refreshFile(uri, config);
+					scanned.push(uri);
 				} catch (error) {
 					output.appendLine(`  ! ${vscode.workspace.asRelativePath(uri)}: ${describe(error)}`);
 				}
 
+				checked++;
+				progress.report({
+					increment: 100 / files.length,
+					message: `${checked}/${files.length}`
+				});
+			}
+
+			// Scope leaks follow calls between files, so they are only complete once every file is in.
+			diagnostics.flushScopeLeaks();
+
+			for (const uri of scanned) {
+				const found = diagnostics.shownCount(uri);
 				if (found > 0) {
 					issueCount += found;
 					fileCount++;
@@ -193,12 +275,6 @@ async function checkWorkspace(diagnostics: SqfDiagnostics, output: vscode.Output
 						}`
 					);
 				}
-
-				checked++;
-				progress.report({
-					increment: 100 / files.length,
-					message: `${checked}/${files.length}`
-				});
 			}
 
 			const summary =

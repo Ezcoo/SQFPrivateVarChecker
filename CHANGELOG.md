@@ -1,5 +1,29 @@
 # Changelog
 
+## [Unreleased]
+
+- Scope leak detection: follows `call` chains across files, any number of calls
+  deep, and reports a non-private assignment in a called function that overwrites a
+  local variable existing where the call is made, both at the assignment and at the
+  call (`detectScopeLeaks`, `scopeLeakSeverity`, defaulting to `error`). Functions are
+  resolved from `CfgFunctions` in `description.ext` / `CfgFunctions.hpp`, from
+  `anyName = compile preprocessFileLineNumbers "file.sqf"` definitions (any name), and from
+  `call compile preprocessFileLineNumbers "file.sqf"`, and local variables holding a
+  code block or a compiled file (`private _fnc = {...}; call _fnc`) when assigned
+  exactly once in the file.
+- Renamed the "ultra high risk" check to "high risk": the `ultraHighRiskSeverity`
+  setting is now `highRiskSeverity` (the old name is still honoured when the new one
+  is not set), and the diagnostic code is now `high-risk`.
+- Now that confirmed scope leaks are reported as errors, the checks that only flag
+  *possible* problems are less severe by default: high risk (`highRiskSeverity`) is
+  now `warning` (previously `error`), and both duplicate-name
+  (`duplicateNameSeverity`, previously `error`) and plain missing-private
+  (`severity`, previously `warning`) are now `information`. `minimumSeverity` now
+  defaults to `information` (previously `hint`), so all of these still show.
+  An existing explicit `minimumSeverity` other than `information` in the user
+  settings is removed once on upgrade, so nothing stays hidden by an older value;
+  changing it afterwards is respected. Workspace and folder settings are not touched.
+
 ## [0.2.0]
 
 - High-risk detection: a non-private local variable whose name is missing

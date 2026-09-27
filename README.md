@@ -8,7 +8,7 @@ classic source of hard-to-trace bugs in Arma mission and mod code.
 params ["_unit"];
 
 private _position = getPosATL _unit;   // fine
-_speed = speed _unit;                  // warning: assigned without being declared private
+_speed = speed _unit;                  // assigned without being declared private
 ```
 
 ## Features
@@ -22,16 +22,44 @@ _speed = speed _unit;                  // warning: assigned without being declar
   fixes every occurrence in the file at once.
 - **Cross-file duplicate-name check** — if a non-private variable's name is also used
   as a local variable in a *different* `.sqf` file in the workspace, it is reported
-  separately and more severely than a plain missing-private warning, since the
+  separately from a plain missing-private diagnostic, with its own message and severity
+  setting (`duplicateNameSeverity`, `information` by default), since the
   non-private one can silently read or overwrite the other file's variable if the two
   ever end up sharing a scope (for example one script `call`s or inlines the other).
   Two local variables sharing a name *within the same file* are not affected — normal
   SQF scoping already covers that case.
 - **High risk detection** — if a non-private variable's name has *more than one*
   non-private occurrence across the workspace (i.e. two or more files, not just one,
-  all forgot `private` for the same name), it is reported even more severely than a
-  plain duplicate-name collision: none of those occurrences has private scope protecting
-  it. Its own `ultraHighRiskSeverity` setting controls how severe that is (`error` by default).
+  all forgot `private` for the same name), it is reported separately from a plain
+  duplicate-name collision: none of those occurrences has private scope protecting
+  it. Its own `highRiskSeverity` setting controls how severe that is (`warning` by
+  default). Both this and the duplicate-name check point at *possible* collisions; the
+  scope leak check below reports the *confirmed* ones, as errors.
+- **Scope leak detection** — `call` runs the callee inside the caller's scope, so a
+  non-private assignment in a called function overwrites the caller's variable of the
+  same name if one exists. The checker follows every `call` across files, however
+  many calls deep, and reports each *confirmed* case (the variable really exists where
+  the call is made) both at the assignment and at the call, whether the overwrite was
+  intentional or not. Callees are resolved from:
+  - `CfgFunctions` in `description.ext` or `CfgFunctions.hpp` (including the default
+    `functions\Category\fn_name.sqf` paths, category and function `file` attributes,
+    and `tag` overrides),
+  - `anyName = compile preprocessFileLineNumbers "path\file.sqf"` in any `.sqf` file:
+    the name is whatever is assigned to and need not follow the `TAG_fnc_name`
+    convention (also `compileFinal`, `preprocessFile`, `loadFile`, `compileScript`,
+    nested forms like `compileFinal compile (...)`, and
+    `missionNamespace setVariable ["anyName", compile ...]`),
+  - `call compile preprocessFileLineNumbers "path\file.sqf"` directly,
+  - local variables in the same file: `private _fnc = {...}; call _fnc` or
+    `private _fnc = compile preprocessFileLineNumbers "file.sqf"; call _fnc`, as long
+    as `_fnc` is assigned exactly once in that file (otherwise what it holds at the
+    call is not certain, so it is not followed). Code blocks can call each other and
+    global functions, and those chains are followed too.
+
+  Assignments inside code that runs elsewhere (`spawn {...}`, and code passed in arrays,
+  e.g. to `addEventHandler`) are not counted. Inline `call {...}` blocks are checked
+  like any other block in the file. Controlled by `detectScopeLeaks` and
+  `scopeLeakSeverity` (`error` by default).
 - **Severity filtering** — `minimumSeverity` hides diagnostics below a chosen severity,
   in both the Problems panel and workspace scan summaries. For example, set it to
   `warning` to see warnings and errors but hide information/hint entries, or to `error`
@@ -67,11 +95,13 @@ bodies do not produce false positives.
 | `sqfPrivateVariableChecker.enable` | `true` | Turn the checker off entirely |
 | `sqfPrivateVariableChecker.include` | `**/*.sqf` | Files included in a workspace scan |
 | `sqfPrivateVariableChecker.exclude` | `["**/node_modules/**", "**/.git/**"]` | Files excluded from a workspace scan |
-| `sqfPrivateVariableChecker.severity` | `warning` | `error`, `warning`, `information` or `hint` |
+| `sqfPrivateVariableChecker.severity` | `information` | Severity for a plain missing-private variable: `error`, `warning`, `information` or `hint` |
 | `sqfPrivateVariableChecker.flagDuplicateLocalNames` | `true` | Cross-check non-private variables against every other `.sqf` file in the workspace |
-| `sqfPrivateVariableChecker.duplicateNameSeverity` | `error` | Severity for a non-private variable whose name is also used in another file |
-| `sqfPrivateVariableChecker.ultraHighRiskSeverity` | `error` | Severity for a non-private variable whose name is missing `private` in two or more different files |
-| `sqfPrivateVariableChecker.minimumSeverity` | `hint` | Hide diagnostics below this severity, e.g. `warning` for warnings + errors, or `error` for errors only |
+| `sqfPrivateVariableChecker.duplicateNameSeverity` | `information` | Severity for a non-private variable whose name is also used in another file |
+| `sqfPrivateVariableChecker.highRiskSeverity` | `warning` | Severity for a non-private variable whose name is missing `private` in two or more different files |
+| `sqfPrivateVariableChecker.detectScopeLeaks` | `true` | Follow `call` chains across files and report assignments that overwrite a caller's local variable |
+| `sqfPrivateVariableChecker.scopeLeakSeverity` | `error` | Severity for such a confirmed scope leak |
+| `sqfPrivateVariableChecker.minimumSeverity` | `information` | Hide diagnostics below this severity, e.g. `warning` for warnings + errors, or `error` for errors only |
 | `sqfPrivateVariableChecker.checkOnType` | `true` | Re-check while typing, otherwise only on open and save |
 | `sqfPrivateVariableChecker.treatParamsAsPrivate` | `true` | Accept `params [...]` as a declaration |
 | `sqfPrivateVariableChecker.treatForLoopVariablesAsPrivate` | `true` | Accept `for "_i"` as a declaration |
@@ -88,16 +118,22 @@ npm test          # unit tests plus integration tests in a real VS Code instance
 Press `F5` to launch the Extension Development Host, then open `examples/sample.sqf`,
 `examples/sample2.sqf` and `examples/sample3.sqf` to see the checker at work,
 including the duplicate-name case (`_index`, missing private in one file only) and
-the ultra-high-risk case (`_speed`, missing private in two files at once).
+the high-risk case (`_speed`, missing private in two files at once). Run
+`SQF: Check Workspace` with the `examples` folder open to see a scope leak:
+`examples/sample4.sqf` calls `TAG_fnc_countNearby` (declared in
+`examples/description.ext`), which overwrites its `_count`.
 
 Source layout:
 
 - `src/analyzer/tokenizer.ts` — SQF tokenizer (comments, strings, preprocessor)
 - `src/analyzer/analyzer.ts` — per-file scope tracking and the missing-private rule,
-  free of VS Code APIs
+  plus the file's `call` sites and `compile`d function definitions; free of VS Code APIs
+- `src/analyzer/functionConfig.ts` — reads function names and paths from `CfgFunctions`
+- `src/scopeLeaks.ts` — follows `call` chains across files to find assignments that
+  overwrite a caller's local variable; also free of VS Code APIs
 - `src/workspaceIndex.ts` — tracks which local variable names each scanned file uses,
   and which of those are missing `private` there, to power the cross-file
-  duplicate-name and ultra-high-risk checks; also free of VS Code APIs
+  duplicate-name and high-risk checks; also free of VS Code APIs
 - `src/diagnostics.ts` — runs the analyzer per file, keeps the workspace index up to
   date, and turns the results into diagnostics for open documents and files on disk
 - `src/quickFix.ts` — the `private` insertion code actions

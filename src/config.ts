@@ -2,6 +2,8 @@ import * as vscode from 'vscode';
 import { AnalyzerOptions } from './analyzer/analyzer';
 
 export const CONFIG_SECTION = 'sqfPrivateVariableChecker';
+/** What `highRiskSeverity` was called in 0.2.0; still honoured when only it is set. */
+const LEGACY_HIGH_RISK_SEVERITY = 'ultraHighRiskSeverity';
 
 export interface CheckerConfig extends AnalyzerOptions {
 	enable: boolean;
@@ -21,7 +23,14 @@ export interface CheckerConfig extends AnalyzerOptions {
 	 * can freely collide with each other. Stronger than a plain duplicate name, where
 	 * only one side is missing `private`.
 	 */
-	ultraHighRiskSeverity: vscode.DiagnosticSeverity;
+	highRiskSeverity: vscode.DiagnosticSeverity;
+	/**
+	 * Follow `call` chains across files and report non-private assignments that
+	 * overwrite a local variable of some caller up the chain.
+	 */
+	detectScopeLeaks: boolean;
+	/** Severity for such a confirmed scope leak, at both the assignment and the call. */
+	scopeLeakSeverity: vscode.DiagnosticSeverity;
 	/** Diagnostics less severe than this (e.g. Hint when this is Warning) are hidden. */
 	minimumSeverity: vscode.DiagnosticSeverity;
 	checkOnType: boolean;
@@ -35,16 +44,26 @@ export function readConfig(scope?: vscode.ConfigurationScope): CheckerConfig {
 		enable: config.get<boolean>('enable', true),
 		include: config.get<string>('include', '**/*.sqf'),
 		exclude: toExcludeGlob(exclude),
-		severity: toSeverity(config.get<string>('severity', 'warning')),
-		duplicateNameSeverity: toSeverity(config.get<string>('duplicateNameSeverity', 'error')),
-		ultraHighRiskSeverity: toSeverity(config.get<string>('ultraHighRiskSeverity', 'error')),
-		minimumSeverity: toSeverity(config.get<string>('minimumSeverity', 'hint')),
+		severity: toSeverity(config.get<string>('severity', 'information')),
+		duplicateNameSeverity: toSeverity(config.get<string>('duplicateNameSeverity', 'information')),
+		highRiskSeverity: toSeverity(
+			userValue(config, 'highRiskSeverity') ?? userValue(config, LEGACY_HIGH_RISK_SEVERITY) ?? 'warning'
+		),
+		detectScopeLeaks: config.get<boolean>('detectScopeLeaks', true),
+		scopeLeakSeverity: toSeverity(config.get<string>('scopeLeakSeverity', 'error')),
+		minimumSeverity: toSeverity(config.get<string>('minimumSeverity', 'information')),
 		checkOnType: config.get<boolean>('checkOnType', true),
 		magicVariables: config.get<string[]>('magicVariables', []),
 		treatParamsAsPrivate: config.get<boolean>('treatParamsAsPrivate', true),
 		treatForLoopVariablesAsPrivate: config.get<boolean>('treatForLoopVariablesAsPrivate', true),
 		flagDuplicateLocalNames: config.get<boolean>('flagDuplicateLocalNames', true)
 	};
+}
+
+/** The value the user set for `key` at any level, ignoring the contributed default. */
+function userValue(config: vscode.WorkspaceConfiguration, key: string): string | undefined {
+	const inspected = config.inspect<string>(key);
+	return inspected?.workspaceFolderValue ?? inspected?.workspaceValue ?? inspected?.globalValue;
 }
 
 /** `findFiles` takes a single glob, so several patterns become one brace group. */

@@ -1,0 +1,9 @@
+// Only here to demonstrate the scope leak check: registers TAG_fnc_countNearby,
+// compiled from examples/functions/demo/fn_countNearby.sqf.
+class CfgFunctions {
+    class TAG {
+        class demo {
+            class countNearby {};
+        };
+    };
+};

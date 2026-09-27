@@ -1,6 +1,15 @@
 import * as assert from 'assert';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import * as vscode from 'vscode';
-import { DIAGNOSTIC_CODE_ULTRA_HIGH_RISK, DIAGNOSTIC_SOURCE } from '../diagnostics';
+import {
+	DIAGNOSTIC_CODE_SCOPE_LEAK,
+	DIAGNOSTIC_CODE_SCOPE_LEAK_CALL,
+	DIAGNOSTIC_CODE_HIGH_RISK,
+	DIAGNOSTIC_SOURCE
+} from '../diagnostics';
+import { resetMinimumSeverityOnce } from '../extension';
 
 suite('extension', () => {
 	test('reports diagnostics for an open .sqf document', async () => {
@@ -44,10 +53,10 @@ suite('extension', () => {
 		}
 	});
 
-	test('a name missing private in two files is flagged as ultra high risk', async () => {
+	test('a name missing private in two files is flagged as high risk', async () => {
 		// A name not used by any other test, since this needs to be missing
 		// private in *exactly* two open documents for the assertions below to hold.
-		const content = '_ultraRiskyShared = 1;\n';
+		const content = '_highRiskyShared = 1;\n';
 
 		const first = await vscode.workspace.openTextDocument({ language: 'sqf', content });
 		await vscode.window.showTextDocument(first);
@@ -61,21 +70,89 @@ suite('extension', () => {
 
 		for (const diagnostics of [firstDiagnostics, secondDiagnostics]) {
 			assert.strictEqual(diagnostics.length, 1);
-			assert.strictEqual(diagnostics[0].code, DIAGNOSTIC_CODE_ULTRA_HIGH_RISK);
-			assert.strictEqual(diagnostics[0].severity, vscode.DiagnosticSeverity.Error);
-			assert.ok(diagnostics[0].message.toLowerCase().includes('ultra high risk'));
+			assert.strictEqual(diagnostics[0].code, DIAGNOSTIC_CODE_HIGH_RISK);
+			assert.strictEqual(diagnostics[0].severity, vscode.DiagnosticSeverity.Warning);
+			assert.ok(diagnostics[0].message.toLowerCase().includes('high risk'));
 		}
 	});
 });
 
-async function waitForDiagnostics(uri: vscode.Uri, timeoutMs = 5000): Promise<vscode.Diagnostic[]> {
+suite('minimumSeverity reset', () => {
+	/** Just enough of an ExtensionContext for the reset: in-memory global/workspace state. */
+	function fakeContext(): vscode.ExtensionContext {
+		const memento = () => {
+			const values = new Map<string, unknown>();
+			return {
+				get: (key: string) => values.get(key),
+				update: async (key: string, value: unknown) => void values.set(key, value)
+			};
+		};
+		return { globalState: memento(), workspaceState: memento() } as unknown as vscode.ExtensionContext;
+	}
+
+	test('removes an older explicit value once, then leaves later changes alone', async () => {
+		const config = () => vscode.workspace.getConfiguration('sqfPrivateVariableChecker');
+		await config().update('minimumSeverity', 'warning', vscode.ConfigurationTarget.Global);
+		try {
+			const context = fakeContext();
+			await resetMinimumSeverityOnce(context);
+			assert.strictEqual(config().inspect('minimumSeverity')?.globalValue, undefined);
+			assert.strictEqual(config().get('minimumSeverity'), 'information');
+
+			await config().update('minimumSeverity', 'error', vscode.ConfigurationTarget.Global);
+			await resetMinimumSeverityOnce(context);
+			assert.strictEqual(config().inspect('minimumSeverity')?.globalValue, 'error');
+		} finally {
+			await config().update('minimumSeverity', undefined, vscode.ConfigurationTarget.Global);
+		}
+	});
+});
+
+suite('scope leaks', () => {
+	test('a called file overwriting a caller\'s local is reported at both ends', async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sqf-scope-leak-'));
+		fs.mkdirSync(path.join(dir, 'scripts'));
+		const callerPath = path.join(dir, 'init.sqf');
+		const calleePath = path.join(dir, 'scripts', 'setup.sqf');
+		// Names not used by any other test, to stay clear of the cross-file checks.
+		fs.writeFileSync(
+			callerPath,
+			'private _leakTarget = 1;\ncall compile preprocessFileLineNumbers "scripts\\setup.sqf";\n'
+		);
+		fs.writeFileSync(calleePath, '_leakTarget = 2;\n');
+
+		try {
+			for (const file of [callerPath, calleePath]) {
+				await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(file));
+			}
+
+			const callee = await waitForDiagnostics(vscode.Uri.file(calleePath), 5000, DIAGNOSTIC_CODE_SCOPE_LEAK);
+			assert.strictEqual(callee.length, 1);
+			assert.strictEqual(callee[0].code, DIAGNOSTIC_CODE_SCOPE_LEAK);
+			assert.strictEqual(callee[0].severity, vscode.DiagnosticSeverity.Error);
+			assert.strictEqual(callee[0].relatedInformation?.[0].location.uri.fsPath, callerPath);
+
+			const caller = await waitForDiagnostics(vscode.Uri.file(callerPath), 5000, DIAGNOSTIC_CODE_SCOPE_LEAK_CALL);
+			assert.strictEqual(caller.length, 1);
+			assert.strictEqual(caller[0].range.start.line, 1);
+			assert.ok(caller[0].message.includes('_leakTarget'));
+		} finally {
+			await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+/** Waits until `uri` has diagnostics of ours (with `code`, when given), then returns all of ours. */
+async function waitForDiagnostics(uri: vscode.Uri, timeoutMs = 5000, code?: string): Promise<vscode.Diagnostic[]> {
+	const ours = () => vscode.languages.getDiagnostics(uri).filter(d => d.source === DIAGNOSTIC_SOURCE);
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
-		const diagnostics = vscode.languages.getDiagnostics(uri).filter(d => d.source === DIAGNOSTIC_SOURCE);
-		if (diagnostics.length > 0) {
+		const diagnostics = ours();
+		if (diagnostics.some(d => code === undefined || d.code === code)) {
 			return diagnostics;
 		}
 		await new Promise(resolve => setTimeout(resolve, 100));
 	}
-	return vscode.languages.getDiagnostics(uri).filter(d => d.source === DIAGNOSTIC_SOURCE);
+	return ours();
 }

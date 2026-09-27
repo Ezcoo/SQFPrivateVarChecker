@@ -61,8 +61,8 @@ suite('WorkspaceVariableIndex', () => {
 		assert.strictEqual(index.isUsedElsewhere('_idx', 'file:///b.sqf'), false);
 	});
 
-	suite('otherNonPrivateFiles (ultra high risk)', () => {
-		test('one file missing private, another declaring it private: not ultra high risk', () => {
+	suite('otherNonPrivateFiles (high risk)', () => {
+		test('one file missing private, another declaring it private: not high risk', () => {
 			const index = new WorkspaceVariableIndex();
 			index.update('file:///a.sqf', new Set(['_idx']), new Set(['_idx']));
 			index.update('file:///b.sqf', new Set(['_idx']), new Set());
@@ -71,7 +71,7 @@ suite('WorkspaceVariableIndex', () => {
 			assert.deepStrictEqual(index.otherFiles('_idx', 'file:///a.sqf'), ['file:///b.sqf']);
 		});
 
-		test('two files both missing private: ultra high risk from both sides', () => {
+		test('two files both missing private: high risk from both sides', () => {
 			const index = new WorkspaceVariableIndex();
 			index.update('file:///a.sqf', new Set(['_idx']), new Set(['_idx']));
 			index.update('file:///b.sqf', new Set(['_idx']), new Set(['_idx']));

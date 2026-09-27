@@ -5,7 +5,7 @@
  *
  * - a name that only ever shows up in one file is none of this module's business;
  * - a name used in two or more different files is a "duplicate name";
- * - a name that is missing `private` in two or more different files is "ultra high
+ * - a name that is missing `private` in two or more different files is "high
  *   risk" -- neither occurrence has its own scope, so they can freely read and
  *   overwrite each other.
  *
