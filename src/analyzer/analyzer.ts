@@ -290,6 +290,12 @@ interface Scope {
 	brace: number;
 	/** Code in the block has a `_this` of its own: it is detached, or run with `call`. */
 	bindsThis: boolean;
+	/**
+	 * Names first added to `names` by a statement that is still running, with the token
+	 * index where it ends: `private _a = [] call f` only creates `_a` once `f` has
+	 * returned, so `f` cannot overwrite it.
+	 */
+	pending: Map<string, number>;
 	/** Set on a `case` or `default` block of a `switch`. */
 	guard?: PendingGuard;
 }
@@ -330,7 +336,15 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 
 	// SQF variable names are case insensitive, so every lookup is lowercased.
 	const scopes: Scope[] = [
-		{ id: 0, names: new Set<string>(), nonPrivate: new Set<string>(), detached: false, brace: -1, bindsThis: true }
+		{
+			id: 0,
+			names: new Set<string>(),
+			nonPrivate: new Set<string>(),
+			detached: false,
+			brace: -1,
+			bindsThis: true,
+			pending: new Map<string, number>()
+		}
 	];
 	const flowScopes: FlowScope[] = [
 		{ parent: -1, start: 0, end: text.length, detached: false, repeats: false, statementStart: 0, statementEnd: text.length }
@@ -358,20 +372,25 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 	// `call _fnc` sites, resolved once every assignment to `_fnc` is known.
 	const localCalls: { site: Omit<CallSite, 'target'>; name: string }[] = [];
 
-	const markDeclared = (name: string) => {
+	// `until`: the token index where the statement that creates the variable ends.
+	const markDeclared = (name: string, until: number) => {
 		const scope = scopes[scopes.length - 1];
 		scope.names.add(name.toLowerCase());
 		scope.nonPrivate.add(name.toLowerCase());
+		scope.pending.set(name.toLowerCase(), until);
 	};
 
 	// Used for `private`/`params`/`for` declarations. Only the first time a scope
 	// sees a name counts as an "occurrence" of that local variable, so redundantly
 	// re-declaring it is not recorded twice.
-	const declare = (name: string) => {
+	const declare = (name: string, until?: number) => {
 		const lower = name.toLowerCase();
-		const scope = scopes[scopes.length - 1].names;
-		if (!scope.has(lower)) {
-			scope.add(lower);
+		const scope = scopes[scopes.length - 1];
+		if (!scope.names.has(lower)) {
+			scope.names.add(lower);
+			if (until !== undefined) {
+				scope.pending.set(lower, until);
+			}
 			occurrences.push({ name, isPrivate: true });
 		}
 	};
@@ -445,11 +464,14 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 		}
 		localAssignments.set(lower, entry);
 	};
-	const visibleOwners = () => {
+	// The local variables that exist at token `index`, and the scope of each.
+	const visibleOwners = (index: number) => {
 		const owners = new Map<string, { scope: number; isPrivate: boolean }>();
 		for (let s = scopes.length - 1; s >= 0; s--) {
 			for (const name of scopes[s].names) {
-				if (!owners.has(name)) {
+				// Still being created by the statement `index` is in; an outer one may exist.
+				const pending = scopes[s].pending.get(name);
+				if (!owners.has(name) && !(pending !== undefined && index < pending)) {
 					owners.set(name, { scope: scopes[s].id, isPrivate: !scopes[s].nonPrivate.has(name) });
 				}
 			}
@@ -487,6 +509,7 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 					id: flowScopes.length - 1,
 					names: new Set<string>(),
 					nonPrivate: new Set<string>(),
+					pending: new Map<string, number>(),
 					detached,
 					codeBlock,
 					brace: i,
@@ -531,7 +554,7 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 		const lower = token.value.toLowerCase();
 		// Declarations and assignments take effect once their statement has run.
 		const declareHere = (name: string) => {
-			declare(name);
+			declare(name, statementEnd(tokens, i));
 			addEvent('declare', name, offsetAt(statementEnd(tokens, i)));
 		};
 
@@ -569,7 +592,7 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 		}
 
 		if (lower === 'call') {
-			const owners = visibleOwners();
+			const owners = visibleOwners(i);
 			const site = {
 				start: token.start,
 				visibleNames: new Set(owners.keys()),
@@ -664,7 +687,7 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 			}) - 1], guards);
 			// Record it so the same variable is reported once per scope rather
 			// than on every following assignment.
-			markDeclared(token.value);
+			markDeclared(token.value, statementEnd(tokens, i));
 			occurrences.push({ name: token.value, isPrivate: false });
 		}
 	}

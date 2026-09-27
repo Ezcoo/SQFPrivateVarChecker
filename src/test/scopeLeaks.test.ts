@@ -645,6 +645,35 @@ suite('findScopeLeaks - branches that never both run', () => {
 	});
 });
 
+suite('findScopeLeaks - a variable created by the statement that makes the call', () => {
+	const leaks = (caller: string) => {
+		const files = workspace({ '/m/caller.sqf': caller, '/m/fn_callee.sqf': '_value = 5;\nhint str _value;' });
+		return leakingCalls(findScopeLeaks(files, [fn('TAG_fnc_callee', 'fn_callee.sqf')]));
+	};
+	const leaked = { 'file:///m/caller.sqf': ['_value'] };
+
+	test('does not exist yet during the call', () => {
+		assert.deepStrictEqual(leaks('private _value = [] call TAG_fnc_callee;\nhint str _value;'), {});
+		assert.deepStrictEqual(leaks('_value = [] call TAG_fnc_callee;\nhint str _value;'), {});
+		assert.deepStrictEqual(leaks('private _value = if (a) then { call TAG_fnc_callee } else { 0 };\nhint str _value;'), {});
+	});
+
+	test('but one that existed before does', () => {
+		assert.deepStrictEqual(leaks('private _value = 0;\n_value = [] call TAG_fnc_callee;\nhint str _value;'), leaked);
+		assert.deepStrictEqual(leaks('private _value = 0;\nprivate _value = [] call TAG_fnc_callee;\nhint str _value;'), leaked);
+		// The inner one is not created yet, so the callee overwrites the outer one.
+		assert.deepStrictEqual(
+			leaks('private _value = 0;\nif (a) then { private _value = [] call TAG_fnc_callee; };\nhint str _value;'),
+			leaked
+		);
+	});
+
+	test('exists in the statements after it', () => {
+		assert.deepStrictEqual(leaks('private _value = 0; [] call TAG_fnc_callee;\nhint str _value;'), leaked);
+		assert.deepStrictEqual(leaks('_value = 0;\n[] call TAG_fnc_callee;\nhint str _value;'), leaked);
+	});
+});
+
 suite('findScopeLeaks - switch cases', () => {
 	const callee =
 		'private _message = _this select 0;\nswitch (_message) do {\n\tcase "build": { _var = 1; };\n\tcase "town": { hint "town"; };\n\tdefault { _other = 1; };\n};';

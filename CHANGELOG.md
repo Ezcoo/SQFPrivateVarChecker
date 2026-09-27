@@ -1,7 +1,11 @@
 # Changelog
 
-## [Unreleased]
+## [0.5.0]
 
+- Fixed a false scope leak when the caller's variable is created by the statement that
+  makes the call (`private _x = [] call f`, or `_x = [] call f` for a new `_x`): the
+  value is only assigned once `f` returns, so `f` cannot overwrite it. A variable of
+  the same name that already exists, in that scope or further out, still counts.
 - Functions declared in an addon's `config.cpp` are followed too, so mods get scope
   leak detection across their own functions. `#include`s in `description.ext`,
   `config.cpp` and `CfgFunctions.hpp` are followed (relative paths, any file name),
