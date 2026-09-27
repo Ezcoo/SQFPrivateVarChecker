@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { analyzeFile, CallSite, CodeBlock, CompiledFunction, createPositionMapper, SqfIssue } from './analyzer/analyzer';
+import { analyzeFile, CallSite, CodeBlock, CompiledFunction, createPositionMapper, FlowFacts, SqfIssue } from './analyzer/analyzer';
 import { parseCfgFunctions } from './analyzer/functionConfig';
 import { CheckerConfig, readConfig } from './config';
 import { AffectedCaller, findScopeLeaks, FunctionSource, LeakingCall, ScopeLeakResult } from './scopeLeaks';
@@ -13,6 +13,9 @@ export const DIAGNOSTIC_CODE_HIGH_RISK = 'high-risk';
 export const DIAGNOSTIC_CODE_SCOPE_LEAK = 'scope-leak';
 /** The `call` through which that happens. Not fixable by inserting `private` there. */
 export const DIAGNOSTIC_CODE_SCOPE_LEAK_CALL = 'scope-leak-call';
+
+/** Appended to a scope leak whose overwritten value is never read afterwards. */
+const UNUSED_NOTE = ' The overwritten value is not read after the call, so this changes nothing yet, but it might become an issue in the future.';
 
 /** How long to wait after the last file change before re-following call chains. */
 const SCOPE_LEAK_DEBOUNCE_MS = 250;
@@ -36,6 +39,7 @@ interface FileState {
 	callSites: CallSite[];
 	compiledFunctions: CompiledFunction[];
 	codeBlocks: CodeBlock[];
+	flow: FlowFacts;
 }
 
 const NO_LEAKS: ScopeLeakResult = { writes: new Map(), calls: new Map() };
@@ -167,7 +171,8 @@ export class SqfDiagnostics implements vscode.Disposable {
 			nonPrivateNames: result.nonPrivateNames,
 			callSites: result.callSites,
 			compiledFunctions: result.compiledFunctions,
-			codeBlocks: result.codeBlocks
+			codeBlocks: result.codeBlocks,
+			flow: result.flow
 		});
 
 		// Files with the cross-file check turned off do not contribute their names to
@@ -288,12 +293,15 @@ function toRange(
 /** A compact description of a file's scope leaks, to tell whether it needs re-emitting. */
 function leakSignature(leaks: ScopeLeakResult, fileKey: string): string {
 	const writes = [...(leaks.writes.get(fileKey) ?? [])].map(
-		([start, affected]) => `${start}:${affected.map(a => `${a.callerKey}@${a.callSite.start}/${a.chain.join('>')}`).join(',')}`
+		([start, affected]) =>
+			`${start}:${affected.map(a => `${a.callerKey}@${a.callSite.start}/${a.chain.join('>')}/${a.live}`).join(',')}`
 	);
 	const calls = (leaks.calls.get(fileKey) ?? []).map(
 		call =>
 			`${call.callSite.start}-${call.callSite.end}:` +
-			[...call.names].map(([name, origins]) => `${name}=${origins.map(o => `${o.fileKey}@${o.start}`).join(',')}`).join(';')
+			[...call.names]
+				.map(([name, origins]) => `${name}=${origins.map(o => `${o.fileKey}@${o.start}/${o.state}`).join(',')}`)
+				.join(';')
 	);
 	return `${writes.join('|')}#${calls.join('|')}`;
 }
@@ -309,11 +317,17 @@ function scopeLeakDiagnostic(
 	const callerPath = vscode.workspace.asRelativePath(vscode.Uri.parse(first.callerKey));
 	const others = new Set(affected.map(a => `${a.callerKey}@${a.callSite.start}`)).size - 1;
 	const extra = others > 0 ? ` (and ${others} other call${others === 1 ? '' : 's'})` : '';
+	const live = affected.some(a => a.live);
 	const message =
 		`SCOPE LEAK: local variable '${issue.variable}' is assigned without being declared private, and overwrites ` +
-		`the caller's '${issue.variable}' when run via call from ${callerPath}${extra}. Call chain: ${formatChain(first.chain)}.`;
+		`the caller's '${issue.variable}' when run via call from ${callerPath}${extra}. Call chain: ${formatChain(first.chain)}.` +
+		(live ? '' : UNUSED_NOTE);
 
-	const diagnostic = new vscode.Diagnostic(range, message, config.scopeLeakSeverity);
+	const diagnostic = new vscode.Diagnostic(
+		range,
+		message,
+		live ? config.scopeLeakSeverity : config.unusedScopeLeakSeverity
+	);
 	diagnostic.source = DIAGNOSTIC_SOURCE;
 	diagnostic.code = DIAGNOSTIC_CODE_SCOPE_LEAK;
 	diagnostic.relatedInformation = affected
@@ -321,7 +335,8 @@ function scopeLeakDiagnostic(
 			const location = locate(a.callerKey, a.callSite.start, a.callSite.end);
 			return location && new vscode.DiagnosticRelatedInformation(
 				location,
-				`'${issue.variable}' is a local variable here; call chain: ${formatChain(a.chain)}`
+				`'${issue.variable}' is a local variable here${a.live ? '' : ', not read after the call'}; ` +
+					`call chain: ${formatChain(a.chain)}`
 			);
 		})
 		.filter((info): info is vscode.DiagnosticRelatedInformation => info !== undefined);
@@ -338,20 +353,27 @@ function leakingCallDiagnostic(
 	const variables = [...new Set(origins.map(origin => `'${origin.variable}'`))].join(', ');
 	const plural = call.names.size === 1 ? 'variable' : 'variables';
 	const firstPath = vscode.workspace.asRelativePath(vscode.Uri.parse(origins[0].fileKey));
+	const live = origins.some(origin => origin.state === 'live');
 	const message =
 		`SCOPE LEAK: call ${call.callSite.label} overwrites local ${plural} ${variables} of this scope, ` +
-		`assigned without private in ${firstPath}.`;
+		`assigned without private in ${firstPath}.` +
+		(live ? '' : UNUSED_NOTE);
 
-	const diagnostic = new vscode.Diagnostic(toRange(positionAt, call.callSite), message, config.scopeLeakSeverity);
+	const diagnostic = new vscode.Diagnostic(
+		toRange(positionAt, call.callSite),
+		message,
+		live ? config.scopeLeakSeverity : config.unusedScopeLeakSeverity
+	);
 	diagnostic.source = DIAGNOSTIC_SOURCE;
 	diagnostic.code = DIAGNOSTIC_CODE_SCOPE_LEAK_CALL;
 	diagnostic.relatedInformation = origins
 		.map(origin => {
 			const location = locate(origin.fileKey, origin.start, origin.end);
 			const via = origin.chain.length > 0 ? ` (via ${formatChain(origin.chain)})` : '';
+			const unused = live && origin.state !== 'live' ? '; the value it overwrites is not read afterwards' : '';
 			return location && new vscode.DiagnosticRelatedInformation(
 				location,
-				`'${origin.variable}' assigned without private${via}`
+				`'${origin.variable}' assigned without private${via}${unused}`
 			);
 		})
 		.filter((info): info is vscode.DiagnosticRelatedInformation => info !== undefined);

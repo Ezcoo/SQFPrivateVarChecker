@@ -239,3 +239,40 @@ suite('analyzeFile - call sites and compiled functions', () => {
 		assert.strictEqual(result.callSites[0].detached, true);
 	});
 });
+
+suite('analyzeFile - flow facts', () => {
+	/** `repeats` of every block, in source order. */
+	const repeats = (text: string) => analyzeFile(text).flow.scopes.slice(1).map(scope => scope.repeats);
+
+	test('loops and other blocks that may run again repeat', () => {
+		assert.deepStrictEqual(repeats('while {a} do {};'), [true, true]);
+		assert.deepStrictEqual(repeats('{} forEach [1];\nwaitUntil {a};\n_a = [1] select {true};'), [true, true, true]);
+		assert.deepStrictEqual(repeats('for "_i" from 0 to 1 do {};'), [true]);
+	});
+
+	test('blocks known to run at most once do not', () => {
+		assert.deepStrictEqual(repeats('if (a) then {} else {};\nif (a) exitWith {};'), [false, false, false]);
+		assert.deepStrictEqual(repeats('try {} catch {};\ncall {};\nif (a) then [{}, {}];'), [false, false, false, false, false]);
+		assert.deepStrictEqual(repeats('switch (a) do { case 1: {}; default {}; };'), [false, false, false]);
+	});
+
+	test('a repeating block spans its whole statement', () => {
+		const text = 'x = 1;\nwhile {_a < 1} do { call f; };\ny = 2;';
+		const body = analyzeFile(text).flow.scopes[2];
+		assert.strictEqual(text.slice(body.statementStart, body.statementEnd), 'while {_a < 1} do { call f; }');
+	});
+
+	test('assignments and declarations take effect at the end of their statement', () => {
+		const text = 'private _a = 1;\n_a = _a + 1;';
+		const events = analyzeFile(text).flow.events.map(e => [e.kind, text.slice(e.offset, e.offset + 1)]);
+		assert.deepStrictEqual(events, [['declare', ';'], ['read', '_'], ['assign', ';']]);
+	});
+
+	test('records reads in strings, calls that cannot be followed, but not inline calls', () => {
+		const result = analyzeFile('isNil "_a";\ncall _unknown;\ncall {};\ncall TAG_fnc_x;');
+		assert.deepStrictEqual(
+			result.flow.events.map(e => (e.kind === 'call' ? 'call' : `${e.kind} ${e.name}`)),
+			['read _a', 'call', 'read _unknown', 'call']
+		);
+	});
+});

@@ -60,6 +60,22 @@ _speed = speed _unit;                  // assigned without being declared privat
   e.g. to `addEventHandler`) are not counted. Inline `call {...}` blocks are checked
   like any other block in the file. Controlled by `detectScopeLeaks` and
   `scopeLeakSeverity` (`error` by default).
+
+  A leak whose overwritten variable is never read afterwards changes nothing yet, so
+  it is reported with `unusedScopeLeakSeverity` instead (`warning` by default): it
+  still breaks as soon as someone reads the variable after the call. That is only the
+  case when it is certain; when in doubt, it is an error. The value counts as read
+  when, before it is overwritten or its scope ends, it is:
+  - mentioned after the call, including in a string (`isNil "_x"`, `compile "..."`)
+    and inside blocks that run only sometimes,
+  - mentioned anywhere in an enclosing loop (`while`, `for`, `forEach`, `count`,
+    `waitUntil`, ...), since that code runs again after the call,
+  - read by a function called later, or by a callee of that function, that has no
+    variable of its own by that name, or the call cannot be followed at all
+    (`call _param`, `call compile _string`),
+  - read by a function in between on the call chain after the call returns to it,
+  - or the caller's own variable is not declared `private` at the top of its file or
+    code block, so it may belong to the caller's caller in turn.
 - **Severity filtering** — `minimumSeverity` hides diagnostics below a chosen severity,
   in both the Problems panel and workspace scan summaries. For example, set it to
   `warning` to see warnings and errors but hide information/hint entries, or to `error`
@@ -101,6 +117,7 @@ bodies do not produce false positives.
 | `sqfPrivateVariableChecker.highRiskSeverity` | `warning` | Severity for a non-private variable whose name is missing `private` in two or more different files |
 | `sqfPrivateVariableChecker.detectScopeLeaks` | `true` | Follow `call` chains across files and report assignments that overwrite a caller's local variable |
 | `sqfPrivateVariableChecker.scopeLeakSeverity` | `error` | Severity for such a confirmed scope leak |
+| `sqfPrivateVariableChecker.unusedScopeLeakSeverity` | `warning` | Severity for a confirmed scope leak whose overwritten variable is never read afterwards |
 | `sqfPrivateVariableChecker.minimumSeverity` | `information` | Hide diagnostics below this severity, e.g. `warning` for warnings + errors, or `error` for errors only |
 | `sqfPrivateVariableChecker.checkOnType` | `true` | Re-check while typing, otherwise only on open and save |
 | `sqfPrivateVariableChecker.treatParamsAsPrivate` | `true` | Accept `params [...]` as a declaration |

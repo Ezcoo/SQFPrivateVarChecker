@@ -1,4 +1,5 @@
-import { CallSite, CodeBlock, LocalWrite, SqfIssue } from './analyzer/analyzer';
+import { CallSite, CodeBlock, FlowFacts, LocalWrite, SqfIssue } from './analyzer/analyzer';
+import { FrameReads, frameReads, valueAfterCall } from './analyzer/flow';
 
 /**
  * Finds *confirmed* scope leaks across `call` chains.
@@ -15,6 +16,11 @@ import { CallSite, CodeBlock, LocalWrite, SqfIssue } from './analyzer/analyzer';
  * and `compile preprocessFileLineNumbers "file.sqf"` build them. A code block stored in
  * a local variable (`private _fnc = {...}; call _fnc`) is a function body of its own.
  *
+ * Each leak is also marked as `live` or not: whether the overwritten variable may be
+ * read afterwards (by the caller, by anything it calls later, or by the functions in
+ * between on the call chain). One that is not changes nothing yet, but would as soon as
+ * someone reads the variable after the call.
+ *
  * Deliberately free of the `vscode` API so it can be unit tested without an editor.
  */
 
@@ -24,6 +30,7 @@ export interface FileFacts {
 	issues: SqfIssue[];
 	callSites: CallSite[];
 	codeBlocks: CodeBlock[];
+	flow: FlowFacts;
 }
 
 /** A named function and the file path it is compiled from. */
@@ -45,7 +52,15 @@ export interface LeakOrigin {
 	end: number;
 	/** Labels of the calls between the leaking frame and the file that assigns it, outermost first. */
 	chain: string[];
+	/**
+	 * Whether the value it assigns may be read after the call that leaks it: `live` or
+	 * `dead`, or still `open` while it is only known to reach the top of the frame it
+	 * leaks from. Never `open` in a `LeakingCall`.
+	 */
+	state: OriginState;
 }
+
+export type OriginState = 'live' | 'dead' | 'open';
 
 /** A caller whose local variable is overwritten through `callSite`. */
 export interface AffectedCaller {
@@ -55,6 +70,8 @@ export interface AffectedCaller {
 	callSite: CallSite;
 	/** Labels of every call from the caller down to the assigning file, outermost first. */
 	chain: string[];
+	/** Whether the overwritten variable may be read after the call (see `LeakOrigin.state`). */
+	live: boolean;
 }
 
 /** One `call` that lets a callee overwrite local variables visible at the call site. */
@@ -101,6 +118,65 @@ export function findScopeLeaks(files: ReadonlyMap<string, FileFacts>, functions:
 		return targets;
 	};
 
+	// What each frame, once called, reads of its caller's local variables: what it reads
+	// before setting it itself, plus what its own callees read that it does not have a
+	// variable for at the call site. Used to tell whether a later call may read a value.
+	const reads = new Map<string, FrameReads>();
+	const readsInProgress = new Set<string>();
+	const readsOf = (frameKey: string): FrameReads => {
+		const known = reads.get(frameKey);
+		if (known) {
+			return known;
+		}
+		const [key, block] = parseFrameKey(frameKey);
+		const facts = files.get(key);
+		if (!facts || readsInProgress.has(frameKey)) {
+			return { names: new Set(), unknown: false };
+		}
+		readsInProgress.add(frameKey);
+
+		const own = frameReads(facts.flow, facts.callSites, block);
+		const result: FrameReads = { names: new Set(own.names), unknown: own.unknown };
+		for (const [callSite] of callsInFrame(facts, block)) {
+			for (const target of resolveCall(callSite, key)) {
+				const callee = readsOf(target);
+				result.unknown ||= callee.unknown;
+				for (const name of callee.names) {
+					if (!callSite.visibleNames.has(name)) {
+						result.names.add(name);
+					}
+				}
+			}
+		}
+
+		readsInProgress.delete(frameKey);
+		reads.set(frameKey, result);
+		return result;
+	};
+
+	// Whether the value that `callSite` (made in file `key`) leaves in `name` may be
+	// read in that frame, or is still there when the frame returns (`open`).
+	const stateCache = new Map<string, OriginState>();
+	const stateAfter = (key: string, siteIndex: number, name: string): OriginState => {
+		const cacheKey = `${key}\0${siteIndex}\0${name}`;
+		let state = stateCache.get(cacheKey);
+		if (!state) {
+			const facts = files.get(key)!;
+			const value = valueAfterCall(facts.flow, facts.callSites, siteIndex, name);
+			const readLater =
+				value.read ||
+				value.calls.some(later =>
+					resolveCall(facts.callSites[later], key).some(target => {
+						const callee = readsOf(target);
+						return callee.unknown || callee.names.has(name);
+					})
+				);
+			state = readLater ? 'live' : value.end === 'escapes' ? 'open' : 'dead';
+			stateCache.set(cacheKey, state);
+		}
+		return state;
+	};
+
 	// What each frame (a file, or a code block), once called, leaks into its caller's
 	// scope: its own non-private assignments, plus whatever its own callees leak that it
 	// does not have a variable for at the call site (those keep travelling up the chain).
@@ -125,27 +201,25 @@ export function findScopeLeaks(files: ReadonlyMap<string, FileFacts>, functions:
 			? codeBlock.writes
 			: facts.issues.filter(issue => issue.reachesCaller);
 		for (const write of writes) {
+			// What the assigning frame itself does with its own value is its business.
 			addOrigin(result, write.variable.toLowerCase(), {
 				fileKey: key,
 				variable: write.variable,
 				start: write.start,
 				end: write.end,
-				chain: []
+				chain: [],
+				state: 'open'
 			});
 		}
-		for (const callSite of facts.callSites) {
-			// Only calls made directly in this frame run inside it.
-			const inFrame = block === undefined ? !callSite.detached : callSite.codeBlock === block;
-			if (!inFrame) {
-				continue;
-			}
+		for (const [callSite, siteIndex] of callsInFrame(facts, block)) {
 			for (const target of resolveCall(callSite, key)) {
 				for (const [name, origins] of escapesOf(target)) {
 					if (callSite.visibleNames.has(name)) {
 						continue; // Stops here: overwrites this file's own variable.
 					}
 					for (const origin of origins) {
-						addOrigin(result, name, { ...origin, chain: [callSite.label, ...origin.chain] });
+						const state = origin.state === 'open' ? stateAfter(key, siteIndex, name) : origin.state;
+						addOrigin(result, name, { ...origin, chain: [callSite.label, ...origin.chain], state });
 					}
 				}
 			}
@@ -160,14 +234,18 @@ export function findScopeLeaks(files: ReadonlyMap<string, FileFacts>, functions:
 	const calls = new Map<string, LeakingCall[]>();
 
 	for (const [callerKey, facts] of files) {
-		for (const callSite of facts.callSites) {
+		facts.callSites.forEach((callSite, siteIndex) => {
 			const names = new Map<string, LeakOrigin[]>();
 			for (const target of resolveCall(callSite, callerKey)) {
 				for (const [name, origins] of escapesOf(target)) {
 					if (!callSite.visibleNames.has(name)) {
 						continue;
 					}
-					for (const origin of origins) {
+					for (const found of origins) {
+						// A value still there when the frame holding the variable returns is
+						// assumed to be read by whoever called it.
+						const state = found.state === 'open' ? stateAfter(callerKey, siteIndex, name) : found.state;
+						const origin: LeakOrigin = { ...found, state: state === 'dead' ? 'dead' : 'live' };
 						addOrigin(names, name, origin);
 
 						let byStart = writes.get(origin.fileKey);
@@ -176,7 +254,13 @@ export function findScopeLeaks(files: ReadonlyMap<string, FileFacts>, functions:
 							writes.set(origin.fileKey, byStart);
 						}
 						const affected = byStart.get(origin.start) ?? [];
-						affected.push({ name, callerKey, callSite, chain: [callSite.label, ...origin.chain] });
+						affected.push({
+							name,
+							callerKey,
+							callSite,
+							chain: [callSite.label, ...origin.chain],
+							live: origin.state === 'live'
+						});
 						byStart.set(origin.start, affected);
 					}
 				}
@@ -186,7 +270,7 @@ export function findScopeLeaks(files: ReadonlyMap<string, FileFacts>, functions:
 				list.push({ callSite, names });
 				calls.set(callerKey, list);
 			}
-		}
+		});
 	}
 
 	return { writes, calls };
@@ -204,14 +288,33 @@ function parseFrameKey(frameKey: string): [string, number | undefined] {
 		: [frameKey.slice(0, separator), Number(frameKey.slice(separator + 1))];
 }
 
-/** Adds `origin` unless the same assignment is already known, keeping the shortest chain. */
+/** The calls made directly in a frame (the file, or code block `block`), which run inside it, with their indices. */
+function callsInFrame(facts: FileFacts, block: number | undefined): [CallSite, number][] {
+	const result: [CallSite, number][] = [];
+	facts.callSites.forEach((callSite, index) => {
+		if (block === undefined ? !callSite.detached : callSite.codeBlock === block) {
+			result.push([callSite, index]);
+		}
+	});
+	return result;
+}
+
+const STATE_RANK: Record<OriginState, number> = { dead: 0, open: 1, live: 2 };
+
+/**
+ * Adds `origin` unless the same assignment is already known, keeping the shortest
+ * chain. Reached along several chains, it is as live as the livest of them.
+ */
 function addOrigin(map: Map<string, LeakOrigin[]>, name: string, origin: LeakOrigin): void {
 	const list = map.get(name) ?? [];
-	const existing = list.findIndex(o => o.fileKey === origin.fileKey && o.start === origin.start);
-	if (existing === -1) {
+	const index = list.findIndex(o => o.fileKey === origin.fileKey && o.start === origin.start);
+	if (index === -1) {
 		list.push(origin);
-	} else if (origin.chain.length < list[existing].chain.length) {
-		list[existing] = origin;
+	} else {
+		const existing = list[index];
+		const shorter = origin.chain.length < existing.chain.length ? origin : existing;
+		const state = STATE_RANK[origin.state] > STATE_RANK[existing.state] ? origin.state : existing.state;
+		list[index] = { ...shorter, state };
 	}
 	map.set(name, list);
 }

@@ -117,7 +117,7 @@ suite('scope leaks', () => {
 		// Names not used by any other test, to stay clear of the cross-file checks.
 		fs.writeFileSync(
 			callerPath,
-			'private _leakTarget = 1;\ncall compile preprocessFileLineNumbers "scripts\\setup.sqf";\n'
+			'private _leakTarget = 1;\ncall compile preprocessFileLineNumbers "scripts\\setup.sqf";\nhint str _leakTarget;\n'
 		);
 		fs.writeFileSync(calleePath, '_leakTarget = 2;\n');
 
@@ -136,6 +136,31 @@ suite('scope leaks', () => {
 			assert.strictEqual(caller.length, 1);
 			assert.strictEqual(caller[0].range.start.line, 1);
 			assert.ok(caller[0].message.includes('_leakTarget'));
+		} finally {
+			await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test('a leak whose overwritten value is never read is only a warning', async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sqf-scope-leak-'));
+		const callerPath = path.join(dir, 'init.sqf');
+		const calleePath = path.join(dir, 'unused.sqf');
+		fs.writeFileSync(callerPath, 'private _unusedLeak = 1;\ncall compile preprocessFileLineNumbers "unused.sqf";\n');
+		fs.writeFileSync(calleePath, '_unusedLeak = 2;\n');
+
+		try {
+			for (const file of [callerPath, calleePath]) {
+				await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(file));
+			}
+
+			const callee = await waitForDiagnostics(vscode.Uri.file(calleePath), 5000, DIAGNOSTIC_CODE_SCOPE_LEAK);
+			assert.strictEqual(callee.length, 1);
+			assert.strictEqual(callee[0].severity, vscode.DiagnosticSeverity.Warning);
+
+			const caller = await waitForDiagnostics(vscode.Uri.file(callerPath), 5000, DIAGNOSTIC_CODE_SCOPE_LEAK_CALL);
+			assert.strictEqual(caller.length, 1);
+			assert.strictEqual(caller[0].severity, vscode.DiagnosticSeverity.Warning);
 		} finally {
 			await vscode.commands.executeCommand('workbench.action.closeAllEditors');
 			fs.rmSync(dir, { recursive: true, force: true });

@@ -52,6 +52,54 @@ export interface CallSite {
 	detached: boolean;
 	/** The code block (index into `codeBlocks`) that the call is made from, if any. */
 	codeBlock?: number;
+	/** The flow scope (index into `FlowFacts.scopes`) the call is made in. */
+	scope: number;
+	/** For each of `visibleNames`, the flow scope that holds it, and whether it was declared `private` there. */
+	owners: Map<string, { scope: number; isPrivate: boolean }>;
+}
+
+/**
+ * A `{...}` block (or the file itself, at index 0) as far as following a variable's
+ * value is concerned. Offsets are source offsets.
+ */
+export interface FlowScope {
+	/** Index of the enclosing scope; -1 for the file. */
+	parent: number;
+	start: number;
+	end: number;
+	/** Runs somewhere other than the enclosing scope (see `SqfIssue.reachesCaller`). */
+	detached: boolean;
+	/** Set when the block is a code block stored in a local variable (index into `codeBlocks`). */
+	codeBlock?: number;
+	/**
+	 * May run more than once, so code before a point in it can also run after that
+	 * point: a loop body or condition, `forEach`, `count`, `waitUntil` and the like.
+	 * Only `then`, `else`, `exitWith`, `try`, `catch`, `call`, `isNil`, `switch` and its
+	 * cases are known to run at most once; everything else is assumed to repeat.
+	 */
+	repeats: boolean;
+	/** The statement containing the block (e.g. the whole `while {...} do {...}`), when it `repeats`. */
+	statementStart: number;
+	statementEnd: number;
+}
+
+/**
+ * Something that happens to a local variable, at `offset`, in flow scope `scope`.
+ * `assign` is a non-private assignment and `declare` a `private`/`params`/`for`
+ * declaration; both take effect at the end of their statement (so `_a = _a + 1` reads
+ * `_a` first). A `read` is any other mention, including inside a string
+ * (`isNil "_a"`, `compile "..."`). A `call` has no name: its `offset` is that of the
+ * `call` keyword, and it is either one of `callSites` or a callee that cannot be
+ * followed (`call _param`, `call compile _string`); inline `call {...}` is not one.
+ */
+export type FlowEvent =
+	| { kind: 'read' | 'assign' | 'declare'; name: string; offset: number; scope: number }
+	| { kind: 'call'; offset: number; scope: number };
+
+export interface FlowFacts {
+	scopes: FlowScope[];
+	/** Sorted by offset. */
+	events: FlowEvent[];
 }
 
 /** A local variable assigned without `private` somewhere. */
@@ -97,6 +145,8 @@ export interface AnalyzeResult {
 	compiledFunctions: CompiledFunction[];
 	/** Code blocks stored in local variables, referenced by `CallTarget` and `CallSite.codeBlock`. */
 	codeBlocks: CodeBlock[];
+	/** Reads and writes of local variables, to tell whether a value is used after a call (see `flow.ts`). */
+	flow: FlowFacts;
 }
 
 /** One place in the file where a name first becomes a local variable in some scope. */
@@ -131,9 +181,19 @@ const COMPILE_COMMANDS = new Set(['compile', 'compilefinal', 'compilescript']);
 const PREPROCESS_COMMANDS = new Set(['preprocessfilelinenumbers', 'preprocessfile', 'loadfile']);
 /** Commands whose `{...}` argument runs somewhere else than the current scope. */
 const DETACHING_COMMANDS = new Set(['spawn', 'oneachframe', 'compilefinal']);
+/** Commands whose `{...}` argument runs at most once, in place. */
+const RUN_ONCE_COMMANDS = new Set(['then', 'else', 'exitwith', 'try', 'catch', 'call', 'isnil', 'default']);
+/** Statements whose `do {...}` block runs at most once. */
+const RUN_ONCE_DO_STATEMENTS = new Set(['switch', 'with']);
+/** A local variable name inside a string, e.g. in `isNil "_a"` or `compile "hint str _a"`. */
+const LOCAL_NAME_IN_STRING = /(?<![A-Za-z0-9_])_[A-Za-z0-9_]+/g;
 
 interface Scope {
+	/** Index into `FlowFacts.scopes`. */
+	id: number;
 	names: Set<string>;
+	/** The subset of `names` that were assigned without being declared `private`. */
+	nonPrivate: Set<string>;
 	/** The block does not run in the enclosing scope (see `SqfIssue.reachesCaller`). */
 	detached: boolean;
 	/** Set when the block is a code block stored in a local variable (index into `codeBlocks`). */
@@ -160,7 +220,17 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 	const forDeclare = options.treatForLoopVariablesAsPrivate !== false;
 
 	// SQF variable names are case insensitive, so every lookup is lowercased.
-	const scopes: Scope[] = [{ names: new Set<string>(), detached: false }];
+	const scopes: Scope[] = [{ id: 0, names: new Set<string>(), nonPrivate: new Set<string>(), detached: false }];
+	const flowScopes: FlowScope[] = [
+		{ parent: -1, start: 0, end: text.length, detached: false, repeats: false, statementStart: 0, statementEnd: text.length }
+	];
+	const events: FlowEvent[] = [];
+	const offsetAt = (index: number) => (index < tokens.length ? tokens[index].start : text.length);
+	const currentScope = () => scopes[scopes.length - 1].id;
+	const addEvent = (kind: 'read' | 'assign' | 'declare', name: string, offset: number) =>
+		events.push({ kind, name: name.toLowerCase(), offset, scope: currentScope() });
+	// A `for "_i"` variable belongs to the loop body, which has not been opened yet.
+	let pendingForVariable: string | undefined;
 	const occurrences: NameOccurrence[] = [];
 	const callSites: CallSite[] = [];
 	const compiledFunctions: CompiledFunction[] = [];
@@ -174,7 +244,11 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 	// `call _fnc` sites, resolved once every assignment to `_fnc` is known.
 	const localCalls: { site: Omit<CallSite, 'target'>; name: string }[] = [];
 
-	const markDeclared = (name: string) => scopes[scopes.length - 1].names.add(name.toLowerCase());
+	const markDeclared = (name: string) => {
+		const scope = scopes[scopes.length - 1];
+		scope.names.add(name.toLowerCase());
+		scope.nonPrivate.add(name.toLowerCase());
+	};
 
 	// Used for `private`/`params`/`for` declarations. Only the first time a scope
 	// sees a name counts as an "occurrence" of that local variable, so redundantly
@@ -235,15 +309,19 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 		}
 		localAssignments.set(lower, entry);
 	};
-	const visibleNames = () => {
-		const names = new Set<string>();
+	const visibleOwners = () => {
+		const owners = new Map<string, { scope: number; isPrivate: boolean }>();
 		for (let s = scopes.length - 1; s >= 0; s--) {
-			scopes[s].names.forEach(name => names.add(name));
+			for (const name of scopes[s].names) {
+				if (!owners.has(name)) {
+					owners.set(name, { scope: scopes[s].id, isPrivate: !scopes[s].nonPrivate.has(name) });
+				}
+			}
 			if (scopes[s].detached) {
 				break;
 			}
 		}
-		return names;
+		return owners;
 	};
 
 	const issues: SqfIssue[] = [];
@@ -253,12 +331,34 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 
 		if (token.type === 'symbol') {
 			if (token.value === '{') {
-				scopes.push({
-					names: new Set<string>(),
-					detached: opensDetachedBlock(tokens[i - 1], arrays),
-					codeBlock: codeBlockStarts.get(i)
+				const detached = opensDetachedBlock(tokens[i - 1], arrays);
+				const codeBlock = codeBlockStarts.get(i);
+				const repeats = !detached && mayRepeat(tokens, i, arrays);
+				flowScopes.push({
+					parent: currentScope(),
+					start: token.start,
+					end: text.length,
+					detached,
+					codeBlock,
+					repeats,
+					statementStart: repeats ? offsetAt(statementStart(tokens, i)) : token.start,
+					statementEnd: repeats ? offsetAt(statementEnd(tokens, i)) : token.start
 				});
+				scopes.push({
+					id: flowScopes.length - 1,
+					names: new Set<string>(),
+					nonPrivate: new Set<string>(),
+					detached,
+					codeBlock
+				});
+				if (pendingForVariable !== undefined) {
+					if (tokens[i - 1]?.type === 'ident' && tokens[i - 1].value.toLowerCase() === 'do') {
+						addEvent('declare', pendingForVariable, token.start);
+					}
+					pendingForVariable = undefined;
+				}
 			} else if (token.value === '}' && scopes.length > 1) {
+				flowScopes[currentScope()].end = token.end;
 				scopes.pop();
 			} else if (token.value === '[') {
 				const previous = tokens[i - 1];
@@ -269,15 +369,31 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 			continue;
 		}
 
+		// Strings that declare something (`private "_a"`, `params [...]`, `for "_i"`) are
+		// consumed below; any other mention of a local variable may be a read.
+		if (token.type === 'string') {
+			for (const [name] of token.value.matchAll(LOCAL_NAME_IN_STRING)) {
+				if (!magic.has(name.toLowerCase())) {
+					addEvent('read', name, token.start);
+				}
+			}
+			continue;
+		}
+
 		if (token.type !== 'ident') {
 			continue;
 		}
 
 		const lower = token.value.toLowerCase();
+		// Declarations and assignments take effect once their statement has run.
+		const declareHere = (name: string) => {
+			declare(name);
+			addEvent('declare', name, offsetAt(statementEnd(tokens, i)));
+		};
 
 		if (lower === 'private') {
 			const declared = tokens[i + 1];
-			i = consumePrivate(tokens, i, declare);
+			i = consumePrivate(tokens, i, declareHere);
 			if (declared?.type === 'ident' && tokens[i] === declared && tokens[i + 1]?.value === '=') {
 				recordAssignment(declared.value, i + 2);
 			}
@@ -287,7 +403,7 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 		if (paramsDeclare && lower === 'params') {
 			const next = tokens[i + 1];
 			if (next && next.type === 'symbol' && next.value === '[') {
-				i = declareStringsInArray(tokens, i + 1, declare);
+				i = declareStringsInArray(tokens, i + 1, declareHere);
 			}
 			continue;
 		}
@@ -296,14 +412,27 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 			const next = tokens[i + 1];
 			if (next && next.type === 'string' && isLocalVariableName(next.value)) {
 				declare(next.value);
+				pendingForVariable = next.value;
 				i++;
 			}
 			continue;
 		}
 
 		if (lower === 'call') {
-			const site = { start: token.start, visibleNames: visibleNames(), detached: isDetached(), codeBlock: currentCodeBlock() };
+			const owners = visibleOwners();
+			const site = {
+				start: token.start,
+				visibleNames: new Set(owners.keys()),
+				detached: isDetached(),
+				codeBlock: currentCodeBlock(),
+				scope: currentScope(),
+				owners
+			};
 			const callee = tokens[i + 1];
+			// Inline code is part of this file, so its reads and writes are seen directly.
+			if (!(callee?.type === 'symbol' && callee.value === '{')) {
+				events.push({ kind: 'call', offset: token.start, scope: currentScope() });
+			}
 			if (callee?.type === 'ident' && isLocalVariableName(callee.value)) {
 				const name = callee.value.toLowerCase();
 				if (isReachableLocal(name)) {
@@ -333,6 +462,7 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 
 		const next = tokens[i + 1];
 		const isAssignment = next !== undefined && next.type === 'symbol' && next.value === '=';
+		addEvent(isAssignment ? 'assign' : 'read', token.value, isAssignment ? offsetAt(statementEnd(tokens, i)) : token.start);
 		if (isAssignment) {
 			recordAssignment(token.value, i + 2);
 
@@ -383,8 +513,90 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 		}
 	}
 	callSites.sort((a, b) => a.start - b.start);
+	events.sort((a, b) => a.offset - b.offset);
 
-	return { issues, privateNames, nonPrivateNames, callSites, compiledFunctions, codeBlocks };
+	return {
+		issues,
+		privateNames,
+		nonPrivateNames,
+		callSites,
+		compiledFunctions,
+		codeBlocks,
+		flow: { scopes: flowScopes, events }
+	};
+}
+
+/**
+ * Whether the `{` at `index` opens a block that may run more than once (see
+ * `FlowScope.repeats`). Assumed so unless it is known to run at most once.
+ */
+function mayRepeat(tokens: Token[], index: number, arrays: boolean[]): boolean {
+	const previous = tokens[index - 1];
+	if (previous?.type === 'ident') {
+		const command = previous.value.toLowerCase();
+		if (command === 'do') {
+			const first = tokens[statementStart(tokens, index)];
+			return !(first?.type === 'ident' && RUN_ONCE_DO_STATEMENTS.has(first.value.toLowerCase()));
+		}
+		return !RUN_ONCE_COMMANDS.has(command);
+	}
+	if (previous?.type === 'symbol') {
+		// `case 1: {...}`, and the blocks of `then [{...}, {...}]`.
+		if (previous.value === ':') {
+			return false;
+		}
+		if ((previous.value === '[' || previous.value === ',') && arrays[arrays.length - 1]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/** Index of the first token of the statement containing the token at `index`. */
+function statementStart(tokens: Token[], index: number): number {
+	let depth = 0;
+	for (let i = index - 1; i >= 0; i--) {
+		const token = tokens[i];
+		if (token.type !== 'symbol') {
+			continue;
+		}
+		if (token.value === ')' || token.value === ']' || token.value === '}') {
+			depth++;
+		} else if (token.value === '(' || token.value === '[' || token.value === '{') {
+			if (depth === 0) {
+				return i + 1;
+			}
+			depth--;
+		} else if (depth === 0 && (token.value === ';' || token.value === ',')) {
+			return i + 1;
+		}
+	}
+	return 0;
+}
+
+/**
+ * Index of the token that ends the statement containing the token at `index`: its `;`
+ * or `,`, or the bracket closing the enclosing block. `tokens.length` at the end of the file.
+ */
+function statementEnd(tokens: Token[], index: number): number {
+	let depth = 0;
+	for (let i = index; i < tokens.length; i++) {
+		const token = tokens[i];
+		if (token.type !== 'symbol') {
+			continue;
+		}
+		if (token.value === '(' || token.value === '[' || token.value === '{') {
+			depth++;
+		} else if (token.value === ')' || token.value === ']' || token.value === '}') {
+			if (depth === 0) {
+				return i;
+			}
+			depth--;
+		} else if (depth === 0 && (token.value === ';' || token.value === ',')) {
+			return i;
+		}
+	}
+	return tokens.length;
 }
 
 /**

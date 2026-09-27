@@ -6,8 +6,8 @@ import { createPathResolver, FileFacts, findScopeLeaks, FunctionSource } from '.
 function workspace(sources: Record<string, string>): Map<string, FileFacts> {
 	const files = new Map<string, FileFacts>();
 	for (const [path, text] of Object.entries(sources)) {
-		const { issues, callSites, codeBlocks } = analyzeFile(text);
-		files.set(`file://${path}`, { path, issues, callSites, codeBlocks });
+		const { issues, callSites, codeBlocks, flow } = analyzeFile(text);
+		files.set(`file://${path}`, { path, issues, callSites, codeBlocks, flow });
 	}
 	return files;
 }
@@ -53,6 +53,28 @@ suite('findScopeLeaks', () => {
 	test('no leak when the caller has no such variable at the call site', () => {
 		const files = workspace({
 			'/m/caller.sqf': 'call TAG_fnc_callee;\nprivate _count = 0;',
+			'/m/fn_callee.sqf': '_count = 5;'
+		});
+		const result = findScopeLeaks(files, [fn('TAG_fnc_callee', 'fn_callee.sqf')]);
+		assert.deepStrictEqual(leakingCalls(result), {});
+	});
+
+	test('a variable assigned after the call only leaks into later calls', () => {
+		const files = workspace({
+			'/m/caller.sqf': 'call TAG_fnc_callee;\n_count = 0;\ncall TAG_fnc_callee;',
+			'/m/fn_callee.sqf': '_count = 5;'
+		});
+		const result = findScopeLeaks(files, [fn('TAG_fnc_callee', 'fn_callee.sqf')]);
+
+		const [leak, ...rest] = result.calls.get('file:///m/caller.sqf')!;
+		assert.strictEqual(rest.length, 0);
+		assert.deepStrictEqual([...leak.names.keys()], ['_count']);
+		assert.strictEqual(leak.callSite.start, 'call TAG_fnc_callee;\n_count = 0;\n'.length);
+	});
+
+	test('no leak when the variable is assigned after the call inside a loop body', () => {
+		const files = workspace({
+			'/m/caller.sqf': 'while {true} do {\n\tcall TAG_fnc_callee;\n\tprivate _count = 0;\n};',
 			'/m/fn_callee.sqf': '_count = 5;'
 		});
 		const result = findScopeLeaks(files, [fn('TAG_fnc_callee', 'fn_callee.sqf')]);
@@ -170,6 +192,161 @@ suite('findScopeLeaks - local code', () => {
 		assert.deepStrictEqual(leakingCalls(result), { 'file:///m/a.sqf': ['_count'] });
 		const [affected] = [...result.writes.get('file:///m/b.sqf')!.values()];
 		assert.deepStrictEqual(affected[0].chain, ['TAG_fnc_b', '_fnc']);
+	});
+});
+
+/** `variable name -> whether its overwritten value may be read afterwards`, over every leaking call. */
+function liveness(result: ReturnType<typeof findScopeLeaks>): Record<string, boolean> {
+	const out: Record<string, boolean> = {};
+	for (const calls of result.calls.values()) {
+		for (const call of calls) {
+			for (const [name, origins] of call.names) {
+				out[name] = origins.some(origin => origin.state === 'live');
+			}
+		}
+	}
+	return out;
+}
+
+/** Liveness of `_count` when `caller` calls TAG_fnc_callee, which assigns `_count` without private. */
+function countLiveness(caller: string, callee = '_count = 5;', extra: Record<string, string> = {}): boolean | undefined {
+	const files = workspace({ '/m/caller.sqf': caller, '/m/fn_callee.sqf': callee, ...extra });
+	const functions = [fn('TAG_fnc_callee', 'fn_callee.sqf')].concat(
+		Object.keys(extra).map(path => fn(`TAG_fnc_${path.slice(path.lastIndexOf('_') + 1, -4)}`, path.slice(3)))
+	);
+	return liveness(findScopeLeaks(files, functions))._count;
+}
+
+suite('findScopeLeaks - is the overwritten value read afterwards', () => {
+	test('not when nothing uses the variable after the call', () => {
+		assert.strictEqual(countLiveness('private _count = 0;\ncall TAG_fnc_callee;'), false);
+	});
+
+	test('when it is read after the call', () => {
+		assert.strictEqual(countLiveness('private _count = 0;\ncall TAG_fnc_callee;\nhint str _count;'), true);
+	});
+
+	test('when it is read inside a later block that may run', () => {
+		assert.strictEqual(countLiveness('private _count = 0;\ncall TAG_fnc_callee;\nif (a) then { hint str _count; };'), true);
+	});
+
+	test('when it is mentioned in a string', () => {
+		assert.strictEqual(countLiveness('private _count = 0;\ncall TAG_fnc_callee;\nif (isNil "_count") then {};'), true);
+		assert.strictEqual(countLiveness('private _count = 0;\ncall TAG_fnc_callee;\ncall compile "hint str _count";'), true);
+	});
+
+	test('not when it is overwritten before being read', () => {
+		assert.strictEqual(countLiveness('private _count = 0;\ncall TAG_fnc_callee;\n_count = 1;\nhint str _count;'), false);
+		assert.strictEqual(countLiveness('private _count = 0;\n_count = [] call TAG_fnc_callee;\nhint str _count;'), false);
+	});
+
+	test('when the overwriting assignment reads it first', () => {
+		assert.strictEqual(countLiveness('private _count = 0;\ncall TAG_fnc_callee;\n_count = _count + 1;'), true);
+	});
+
+	test('when it is overwritten only conditionally', () => {
+		assert.strictEqual(
+			countLiveness('private _count = 0;\ncall TAG_fnc_callee;\nif (a) then { _count = 1; };\nhint str _count;'),
+			true
+		);
+	});
+
+	test('not after the scope holding it ends', () => {
+		assert.strictEqual(
+			countLiveness('if (a) then {\n\tprivate _count = 0;\n\tcall TAG_fnc_callee;\n};\nhint str _count;'),
+			false
+		);
+	});
+
+	test('not when only a new private variable of the same name is read', () => {
+		assert.strictEqual(
+			countLiveness('private _count = 0;\ncall TAG_fnc_callee;\nif (a) then { private _count = 1; hint str _count; };'),
+			false
+		);
+		assert.strictEqual(countLiveness('private _count = 0;\ncall TAG_fnc_callee;\nfor "_count" from 1 to 2 do { hint str _count; };'), false);
+	});
+
+	test('when it is read earlier in an enclosing loop', () => {
+		assert.strictEqual(countLiveness('private _count = 0;\nwhile {_count < 10} do { call TAG_fnc_callee; };'), true);
+		assert.strictEqual(countLiveness('private _count = 0;\n{ hint str _count; call TAG_fnc_callee; } forEach [1, 2];'), true);
+	});
+
+	test('not in a block that runs once, or when the loop does not read it', () => {
+		assert.strictEqual(countLiveness('private _count = 0;\nif (a) then { hint str _count; call TAG_fnc_callee; };'), false);
+		assert.strictEqual(countLiveness('private _count = 0;\nfor "_i" from 1 to 3 do { call TAG_fnc_callee; };'), false);
+	});
+
+	test('when the callee itself reads it and runs again in a loop', () => {
+		assert.strictEqual(
+			countLiveness('private _count = 0;\nfor "_i" from 1 to 3 do { call TAG_fnc_callee; };', '_count = _count + 1;'),
+			true
+		);
+	});
+
+	test('when a later call reads it from this scope', () => {
+		const caller = 'private _count = 0;\ncall TAG_fnc_callee;\ncall TAG_fnc_reader;';
+		assert.strictEqual(countLiveness(caller, '_count = 5;', { '/m/fn_reader.sqf': 'hint str _count;' }), true);
+		assert.strictEqual(
+			countLiveness(caller, '_count = 5;', { '/m/fn_reader.sqf': 'params ["_count"];\nhint str _count;' }),
+			false
+		);
+		assert.strictEqual(
+			countLiveness(caller, '_count = 5;', { '/m/fn_reader.sqf': 'call TAG_fnc_deeper;', '/m/fn_deeper.sqf': 'hint str _count;' }),
+			true
+		);
+	});
+
+	test('when a later call runs a local code block that reads it', () => {
+		assert.strictEqual(
+			countLiveness('private _show = { hint str _count; };\nprivate _count = 0;\ncall TAG_fnc_callee;\ncall _show;'),
+			true
+		);
+	});
+
+	test('when a later call cannot be followed', () => {
+		assert.strictEqual(countLiveness('params ["_code"];\nprivate _count = 0;\ncall TAG_fnc_callee;\ncall _code;'), true);
+	});
+
+	test('when the variable is not private itself, so it may be its own caller\'s', () => {
+		assert.strictEqual(countLiveness('_count = 0;\ncall TAG_fnc_callee;'), true);
+	});
+
+	test('when a function in between on the call chain reads it after the call', () => {
+		const leak = (b: string) =>
+			liveness(
+				findScopeLeaks(
+					workspace({ '/m/a.sqf': 'private _r = 0;\ncall TAG_fnc_b;', '/m/b.sqf': b, '/m/d.sqf': '_r = 42;' }),
+					[fn('TAG_fnc_b', 'b.sqf'), fn('TAG_fnc_d', 'd.sqf')]
+				)
+			)._r;
+		assert.strictEqual(leak('call TAG_fnc_d;'), false);
+		assert.strictEqual(leak('call TAG_fnc_d;\nhint str _r;'), true);
+	});
+
+	test('not for a write that a function in between overwrites before anyone reads it', () => {
+		const files = workspace({
+			'/m/a.sqf': 'private _r = 0;\ncall TAG_fnc_b;\nhint str _r;',
+			'/m/b.sqf': 'call TAG_fnc_d;\n_r = 1;',
+			'/m/d.sqf': '_r = 42;'
+		});
+		const result = findScopeLeaks(files, [fn('TAG_fnc_b', 'b.sqf'), fn('TAG_fnc_d', 'd.sqf')]);
+		const liveAt = (key: string) => [...result.writes.get(key)!.values()][0][0].live;
+		assert.strictEqual(liveAt('file:///m/d.sqf'), false);
+		assert.strictEqual(liveAt('file:///m/b.sqf'), true);
+	});
+
+	test('marks each affected caller at the assignment', () => {
+		const files = workspace({
+			'/m/used.sqf': 'private _count = 0;\ncall TAG_fnc_callee;\nhint str _count;',
+			'/m/unused.sqf': 'private _count = 0;\ncall TAG_fnc_callee;',
+			'/m/fn_callee.sqf': '_count = 5;'
+		});
+		const result = findScopeLeaks(files, [fn('TAG_fnc_callee', 'fn_callee.sqf')]);
+		const [affected] = [...result.writes.get('file:///m/fn_callee.sqf')!.values()];
+		assert.deepStrictEqual(
+			affected.map(a => [a.callerKey, a.live]).sort(),
+			[['file:///m/unused.sqf', false], ['file:///m/used.sqf', true]]
+		);
 	});
 });
 

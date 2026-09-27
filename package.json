@@ -134,6 +134,17 @@
           "default": "error",
           "description": "Severity for a confirmed scope leak: a non-private assignment in a called function that overwrites a local variable visible where the function is called. Reported both at the assignment and at the call."
         },
+        "sqfPrivateVariableChecker.unusedScopeLeakSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "default": "warning",
+          "description": "Severity for a confirmed scope leak whose overwritten variable is never read afterwards (not by the caller, not by anything it calls later, and not by the functions in between on the call chain), so it changes nothing yet. Whenever that cannot be ruled out, scopeLeakSeverity is used instead. Change this to 'error' to have an extra safe mode."
+        },
         "sqfPrivateVariableChecker.minimumSeverity": {
           "type": "string",
           "enum": [
