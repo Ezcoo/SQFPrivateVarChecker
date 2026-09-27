@@ -137,17 +137,17 @@ export function valueAfterCall(flow: FlowFacts, callSites: CallSite[], siteIndex
 		return { read: true };
 	}
 
+	// A variable that is not this frame's own, or is assigned without `private` at the
+	// top of a function body, may be its caller's, and so outlive the frame. Code run by
+	// `spawn`, an event handler and the like has no caller to hand it to.
+	const reachesCaller = frame === 0 || scopes[frame].codeBlock !== undefined;
 	let end: 'overwritten' | 'discarded' | 'escapes';
 	if (overwritten) {
 		end = 'overwritten';
-	} else if (!owner) {
+	} else if (reachesCaller && (!owner || (owner.scope === frame && !owner.isPrivate))) {
 		end = 'escapes';
 	} else {
-		// A variable assigned without `private` at the top of a function body may itself
-		// be its caller's, and so outlive the frame. Code run by `spawn` and the like has
-		// no caller to hand it to.
-		const reachesCaller = frame === 0 || scopes[frame].codeBlock !== undefined;
-		end = owner.scope === frame && !owner.isPrivate && reachesCaller ? 'escapes' : 'discarded';
+		end = 'discarded';
 	}
 	return { read: false, calls: [...later].sort((a, b) => a - b), end };
 }

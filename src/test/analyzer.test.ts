@@ -221,6 +221,44 @@ suite('analyzeFile - call sites and compiled functions', () => {
 		assert.deepStrictEqual(result.callSites[0].target, { kind: 'file', path: 'e.sqf' });
 	});
 
+	test('records functions defined as a global code block', () => {
+		const result = analyzeFile(
+			'TAG_fnc_a = { _x1 = 1; private _y1 = 2; call TAG_fnc_b; };\n' +
+				'TAG_fnc_b = {\n\tparams ["_p"];\n\t_x2 = _p;\n};\n' +
+				'call TAG_fnc_a;'
+		);
+		assert.deepStrictEqual(result.codeFunctions, [
+			{ name: 'tag_fnc_a', block: 0 },
+			{ name: 'tag_fnc_b', block: 1 }
+		]);
+		assert.deepStrictEqual(
+			result.codeBlocks.map(block => block.writes.map(write => write.variable)),
+			[['_x1'], ['_x2']]
+		);
+		// Defining a function does not run it: nothing in it reaches this file's caller.
+		assert.deepStrictEqual(result.issues.filter(issue => issue.reachesCaller), []);
+		assert.deepStrictEqual(
+			result.callSites.map(call => [call.label, call.codeBlock]),
+			[['TAG_fnc_b', 0], ['TAG_fnc_a', undefined]]
+		);
+	});
+
+	test('records functions defined with compileFinal or missionNamespace setVariable', () => {
+		const result = analyzeFile(
+			'TAG_fnc_a = compileFinal { _a = 1; };\n' +
+				'missionNamespace setVariable ["TAG_fnc_b", { _b = 1; }];\n' +
+				'missionNamespace setVariable ["TAG_fnc_c", compileFinal { _c = 1; }, true];\n' +
+				// Not global functions: another namespace, an object, a computed name.
+				'uiNamespace setVariable ["TAG_fnc_d", { _d = 1; }];\n' +
+				'player setVariable ["TAG_fnc_e", { _e = 1; }];\n' +
+				'missionNamespace setVariable [_name, { _f = 1; }];'
+		);
+		assert.deepStrictEqual(
+			result.codeFunctions.map(fn => [fn.name, result.codeBlocks[fn.block].writes.map(write => write.variable)]),
+			[['tag_fnc_a', ['_a']], ['tag_fnc_b', ['_b']], ['tag_fnc_c', ['_c']]]
+		);
+	});
+
 	test('assignments in blocks that run elsewhere do not reach the caller', () => {
 		const issues = analyze(
 			'[] spawn { _a = 1; };\n' +
@@ -231,6 +269,25 @@ suite('analyzeFile - call sites and compiled functions', () => {
 		);
 		const reaching = issues.filter(issue => issue.reachesCaller).map(issue => issue.variable);
 		assert.deepStrictEqual(reaching, ['_f', '_d', '_e', '_g']);
+	});
+
+	test('event handlers that take their code directly run it in a scope of their own', () => {
+		const result = analyzeFile(
+			'private _v = 1;\n' +
+				'"TAG_var" addPublicVariableEventHandler { _v = 2; call TAG_fnc_x; };\n' +
+				'onPlayerConnected { _a = 1; };\n' +
+				'player onMapSingleClick { _b = 1; };\n' +
+				'onTeamSwitch { _c = 1; };\n' +
+				'onHCGroupSelectionChanged { _d = 1; };\n' +
+				'onGroupIconClick { _e = 1; };'
+		);
+		assert.deepStrictEqual(
+			result.issues.map(issue => [issue.variable, issue.reachesCaller]),
+			[['_a', false], ['_b', false], ['_c', false], ['_d', false], ['_e', false]]
+		);
+		// The script's own `_v` is out of reach of a call made in the handler.
+		assert.deepStrictEqual([...result.callSites[0].visibleNames], []);
+		assert.strictEqual(result.callSites[0].detached, true);
 	});
 
 	test('a call inside a spawned block only sees the block\'s locals', () => {
@@ -266,6 +323,17 @@ suite('analyzeFile - flow facts', () => {
 		const text = 'private _a = 1;\n_a = _a + 1;';
 		const events = analyzeFile(text).flow.events.map(e => [e.kind, text.slice(e.offset, e.offset + 1)]);
 		assert.deepStrictEqual(events, [['declare', ';'], ['read', '_'], ['assign', ';']]);
+	});
+
+	test('code compiled from a string written in place is not a call that cannot be followed', () => {
+		const calls = (text: string) => analyzeFile(text).flow.events.filter(e => e.kind === 'call').length;
+		assert.strictEqual(calls('call compile "hint str _a";'), 0);
+		assert.strictEqual(calls('Call Compile Format ["WFBE_PVF_%1 = _pvf; publicVariable \'WFBE_PVF_%1\';", _func];'), 0);
+		assert.strictEqual(calls('call compile (format ["TAG_%1 = 1", _x]);'), 0);
+		// A placeholder that can start a name of its own could be any local variable.
+		assert.strictEqual(calls('call compile format ["%1 = 5", _name];'), 1);
+		assert.strictEqual(calls('call compile _code;'), 1);
+		assert.strictEqual(calls('call compile format [_template, 1];'), 1);
 	});
 
 	test('records reads in strings, calls that cannot be followed, but not inline calls', () => {

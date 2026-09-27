@@ -1,4 +1,4 @@
-import { CallSite, CodeBlock, FlowFacts, LocalWrite, SqfIssue } from './analyzer/analyzer';
+import { CallSite, CodeBlock, CodeFunction, FlowFacts, LocalWrite, SqfIssue } from './analyzer/analyzer';
 import { FrameReads, frameReads, valueAfterCall } from './analyzer/flow';
 
 /**
@@ -30,6 +30,8 @@ export interface FileFacts {
 	issues: SqfIssue[];
 	callSites: CallSite[];
 	codeBlocks: CodeBlock[];
+	/** Global functions defined in the file as a code block, which calls to them run. */
+	codeFunctions: CodeFunction[];
 	flow: FlowFacts;
 }
 
@@ -88,7 +90,15 @@ export interface ScopeLeakResult {
 	calls: Map<string, LeakingCall[]>;
 }
 
-export function findScopeLeaks(files: ReadonlyMap<string, FileFacts>, functions: FunctionSource[]): ScopeLeakResult {
+/**
+ * `related(a, b)` tells whether code in the files at paths `a` and `b` can ever run
+ * together (see `MissionRoots`); calls are only followed between related files.
+ */
+export function findScopeLeaks(
+	files: ReadonlyMap<string, FileFacts>,
+	functions: FunctionSource[],
+	related: (a: string, b: string) => boolean = () => true
+): ScopeLeakResult {
 	const resolvePath = createPathResolver(files);
 
 	const functionsByName = new Map<string, FunctionSource[]>();
@@ -96,6 +106,15 @@ export function findScopeLeaks(files: ReadonlyMap<string, FileFacts>, functions:
 		const list = functionsByName.get(fn.name) ?? [];
 		list.push(fn);
 		functionsByName.set(fn.name, list);
+	}
+	// Frame keys of the functions defined as `TAG_fnc_foo = {...}`, by name.
+	const codeFunctionsByName = new Map<string, string[]>();
+	for (const [key, facts] of files) {
+		for (const fn of facts.codeFunctions) {
+			const list = codeFunctionsByName.get(fn.name) ?? [];
+			list.push(codeBlockKey(key, fn.block));
+			codeFunctionsByName.set(fn.name, list);
+		}
 	}
 
 	// Returns frame keys: a file key, or `codeBlockKey(...)` for a code block.
@@ -110,9 +129,15 @@ export function findScopeLeaks(files: ReadonlyMap<string, FileFacts>, functions:
 			} else if (target.kind === 'file') {
 				keys = [resolvePath(target.path, files.get(callerKey)!.path)];
 			} else {
-				keys = (functionsByName.get(target.name) ?? []).map(fn => resolvePath(fn.path, fn.definedIn));
+				keys = (functionsByName.get(target.name) ?? [])
+					.map(fn => resolvePath(fn.path, fn.definedIn))
+					.concat(codeFunctionsByName.get(target.name) ?? []);
 			}
-			targets = [...new Set(keys.filter((key): key is string => key !== undefined))];
+			const callerPath = files.get(callerKey)!.path;
+			targets = [...new Set(keys.filter((key): key is string => key !== undefined))].filter(frameKey => {
+				const targetPath = files.get(parseFrameKey(frameKey)[0])?.path;
+				return targetPath !== undefined && related(callerPath, targetPath);
+			});
 			targetsCache.set(callSite, targets);
 		}
 		return targets;
@@ -175,6 +200,48 @@ export function findScopeLeaks(files: ReadonlyMap<string, FileFacts>, functions:
 			stateCache.set(cacheKey, state);
 		}
 		return state;
+	};
+
+	// Every `call` that runs each frame, as [caller file key, index into its callSites].
+	const callers = new Map<string, [string, number][]>();
+	for (const [callerKey, facts] of files) {
+		facts.callSites.forEach((callSite, siteIndex) => {
+			for (const target of resolveCall(callSite, callerKey)) {
+				const list = callers.get(target) ?? [];
+				list.push([callerKey, siteIndex]);
+				callers.set(target, list);
+			}
+		});
+	}
+
+	// Whether a value still in `name` when frame `frameKey` returns may be read by one of
+	// the calls that run it, or by their callers in turn. Only calls found in the
+	// workspace count: a frame nobody calls (run with `execVM`, `spawn`, as an event
+	// handler, ...) takes its variables with it.
+	const liveOnReturn = new Map<string, boolean>();
+	const returnInProgress = new Set<string>();
+	const isLiveOnReturn = (frameKey: string, name: string): boolean => {
+		const cacheKey = `${frameKey}\0${name}`;
+		const known = liveOnReturn.get(cacheKey);
+		if (known !== undefined) {
+			return known;
+		}
+		// Recursion: the frame already being checked is answered by its other callers.
+		if (returnInProgress.has(cacheKey)) {
+			return false;
+		}
+		returnInProgress.add(cacheKey);
+		const live = (callers.get(frameKey) ?? []).some(([callerKey, siteIndex]) => {
+			const state = stateAfter(callerKey, siteIndex, name);
+			return state === 'live' || (state === 'open' && isLiveOnReturn(frameOfCall(callerKey, siteIndex), name));
+		});
+		returnInProgress.delete(cacheKey);
+		liveOnReturn.set(cacheKey, live);
+		return live;
+	};
+	const frameOfCall = (key: string, siteIndex: number): string => {
+		const block = files.get(key)!.callSites[siteIndex].codeBlock;
+		return block === undefined ? key : codeBlockKey(key, block);
 	};
 
 	// What each frame (a file, or a code block), once called, leaks into its caller's
@@ -242,10 +309,13 @@ export function findScopeLeaks(files: ReadonlyMap<string, FileFacts>, functions:
 						continue;
 					}
 					for (const found of origins) {
-						// A value still there when the frame holding the variable returns is
-						// assumed to be read by whoever called it.
-						const state = found.state === 'open' ? stateAfter(callerKey, siteIndex, name) : found.state;
-						const origin: LeakOrigin = { ...found, state: state === 'dead' ? 'dead' : 'live' };
+						// The variable is this frame's, but when it is not declared private it
+						// may be its caller's too, and the value lives on there.
+						let state = found.state === 'open' ? stateAfter(callerKey, siteIndex, name) : found.state;
+						if (state === 'open') {
+							state = isLiveOnReturn(frameOfCall(callerKey, siteIndex), name) ? 'live' : 'dead';
+						}
+						const origin: LeakOrigin = { ...found, state };
 						addOrigin(names, name, origin);
 
 						let byStart = writes.get(origin.fileKey);

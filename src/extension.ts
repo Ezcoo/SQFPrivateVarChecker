@@ -1,11 +1,14 @@
 import * as vscode from 'vscode';
 import { CONFIG_SECTION, readConfig } from './config';
 import { isFunctionConfigFile, isSqfDocument, SqfDiagnostics } from './diagnostics';
+import { MissionRoots } from './missions';
 import { AddPrivateQuickFix } from './quickFix';
 
 const DEBOUNCE_MS = 300;
 /** Candidates for `description.ext` and `CfgFunctions.hpp`; filtered by `isFunctionConfigFile`. */
 const FUNCTION_CONFIG_GLOB = '**/*.{ext,hpp,EXT,HPP}';
+/** Candidates for `description.ext` and `mission.sqm`, which mark a mission folder; filtered by `MissionRoots.isMarker`. */
+const MISSION_MARKER_GLOB = '**/*.{ext,sqm,EXT,SQM}';
 
 export function activate(context: vscode.ExtensionContext) {
 	const diagnostics = new SqfDiagnostics();
@@ -88,6 +91,14 @@ export function activate(context: vscode.ExtensionContext) {
 		configWatcher.onDidDelete(uri => diagnostics.deleteFunctionConfig(uri))
 	);
 
+	// Mission folders, so that several missions in one workspace are kept apart.
+	const missionWatcher = vscode.workspace.createFileSystemWatcher(MISSION_MARKER_GLOB, false, true, false);
+	context.subscriptions.push(
+		missionWatcher,
+		missionWatcher.onDidCreate(uri => diagnostics.setMissionMarker(uri, true)),
+		missionWatcher.onDidDelete(uri => diagnostics.setMissionMarker(uri, false))
+	);
+
 	context.subscriptions.push(
 		vscode.languages.registerCodeActionsProvider(
 			[{ language: 'sqf' }, { pattern: '**/*.sqf' }],
@@ -158,6 +169,17 @@ export async function resetMinimumSeverityOnce(context: vscode.ExtensionContext)
 	);
 }
 
+/**
+ * Finds every mission folder in the workspace. Done before any file is checked, so the
+ * first pass already keeps missions apart.
+ */
+async function indexMissions(diagnostics: SqfDiagnostics, exclude: string | null): Promise<void> {
+	const files = await vscode.workspace.findFiles(MISSION_MARKER_GLOB, exclude ?? undefined);
+	for (const uri of files.filter(uri => MissionRoots.isMarker(uri.path))) {
+		diagnostics.setMissionMarker(uri, true);
+	}
+}
+
 /** Reads every `description.ext` and `CfgFunctions.hpp` in the workspace. */
 async function indexFunctionConfigs(diagnostics: SqfDiagnostics, exclude: string | null): Promise<void> {
 	const files = await vscode.workspace.findFiles(FUNCTION_CONFIG_GLOB, exclude ?? undefined);
@@ -188,6 +210,7 @@ async function indexWorkspaceQuietly(diagnostics: SqfDiagnostics): Promise<void>
 
 	let files: vscode.Uri[];
 	try {
+		await indexMissions(diagnostics, config.exclude);
 		await indexFunctionConfigs(diagnostics, config.exclude);
 		files = await vscode.workspace.findFiles(config.include, config.exclude ?? undefined);
 	} catch {
@@ -239,6 +262,7 @@ async function checkWorkspace(diagnostics: SqfDiagnostics, output: vscode.Output
 			let fileCount = 0;
 			let checked = 0;
 
+			await indexMissions(diagnostics, config.exclude);
 			await indexFunctionConfigs(diagnostics, config.exclude);
 
 			const scanned: vscode.Uri[] = [];

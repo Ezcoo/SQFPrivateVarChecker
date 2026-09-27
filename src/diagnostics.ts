@@ -1,7 +1,17 @@
 import * as vscode from 'vscode';
-import { analyzeFile, CallSite, CodeBlock, CompiledFunction, createPositionMapper, FlowFacts, SqfIssue } from './analyzer/analyzer';
+import {
+	analyzeFile,
+	CallSite,
+	CodeBlock,
+	CodeFunction,
+	CompiledFunction,
+	createPositionMapper,
+	FlowFacts,
+	SqfIssue
+} from './analyzer/analyzer';
 import { parseCfgFunctions } from './analyzer/functionConfig';
 import { CheckerConfig, readConfig } from './config';
+import { MissionRoots } from './missions';
 import { AffectedCaller, findScopeLeaks, FunctionSource, LeakingCall, ScopeLeakResult } from './scopeLeaks';
 import { WorkspaceVariableIndex } from './workspaceIndex';
 
@@ -38,6 +48,7 @@ interface FileState {
 	nonPrivateNames: Set<string>;
 	callSites: CallSite[];
 	compiledFunctions: CompiledFunction[];
+	codeFunctions: CodeFunction[];
 	codeBlocks: CodeBlock[];
 	flow: FlowFacts;
 }
@@ -48,6 +59,8 @@ export class SqfDiagnostics implements vscode.Disposable {
 	private readonly collection: vscode.DiagnosticCollection;
 	/** Which local variable names every scanned file uses, to power the cross-file check. */
 	private readonly index = new WorkspaceVariableIndex();
+	/** Mission folders, so that several missions in one workspace are kept apart. */
+	private readonly missions = new MissionRoots();
 	private readonly files = new Map<string, FileState>();
 	/** Functions declared in each `description.ext` / `CfgFunctions.hpp`, by file key. */
 	private readonly configFunctions = new Map<string, FunctionSource[]>();
@@ -69,6 +82,7 @@ export class SqfDiagnostics implements vscode.Disposable {
 		this.files.clear();
 		this.configFunctions.clear();
 		this.index.clear();
+		this.missions.clear();
 		this.leaks = NO_LEAKS;
 	}
 
@@ -84,6 +98,25 @@ export class SqfDiagnostics implements vscode.Disposable {
 		const functions = parseCfgFunctions(text, bareTags).map(fn => ({ ...fn, definedIn: uri.path }));
 		this.configFunctions.set(uri.toString(), functions);
 		this.scheduleScopeLeaks();
+	}
+
+	/**
+	 * Records whether a `description.ext` or `mission.sqm` exists at `uri`, which makes
+	 * its folder a mission. When that changes which files belong together, every file
+	 * is re-emitted and call chains are followed again.
+	 */
+	setMissionMarker(uri: vscode.Uri, exists: boolean): void {
+		if (!MissionRoots.isMarker(uri.path)) {
+			return;
+		}
+		const changed = exists ? this.missions.add(uri.path) : this.missions.remove(uri.path);
+		if (changed) {
+			for (const key of this.files.keys()) {
+				const fileUri = vscode.Uri.parse(key);
+				this.emit(fileUri, readConfig(fileUri));
+			}
+			this.scheduleScopeLeaks();
+		}
 	}
 
 	deleteFunctionConfig(uri: vscode.Uri): void {
@@ -109,7 +142,7 @@ export class SqfDiagnostics implements vscode.Disposable {
 		}
 
 		const previous = this.leaks;
-		this.leaks = findScopeLeaks(this.files, functions);
+		this.leaks = findScopeLeaks(this.files, functions, (a, b) => this.missions.related(a, b));
 
 		for (const key of this.files.keys()) {
 			if (leakSignature(previous, key) !== leakSignature(this.leaks, key)) {
@@ -171,6 +204,7 @@ export class SqfDiagnostics implements vscode.Disposable {
 			nonPrivateNames: result.nonPrivateNames,
 			callSites: result.callSites,
 			compiledFunctions: result.compiledFunctions,
+			codeFunctions: result.codeFunctions,
 			codeBlocks: result.codeBlocks,
 			flow: result.flow
 		});
@@ -231,9 +265,13 @@ export class SqfDiagnostics implements vscode.Disposable {
 				if (affected && affected[0].name === lower) {
 					return scopeLeakDiagnostic(issue, range, config, affected, locate);
 				}
-				const otherFiles = config.flagDuplicateLocalNames ? this.index.otherFiles(lower, key) : [];
+				// Only files that can ever run together with this one (the same mission,
+				// or code shared by all of them) can collide with it.
+				const related = (other: string) =>
+					this.missions.related(state.path, this.files.get(other)?.path ?? vscode.Uri.parse(other).path);
+				const otherFiles = config.flagDuplicateLocalNames ? this.index.otherFiles(lower, key).filter(related) : [];
 				const otherNonPrivateFiles = config.flagDuplicateLocalNames
-					? this.index.otherNonPrivateFiles(lower, key)
+					? this.index.otherNonPrivateFiles(lower, key).filter(related)
 					: [];
 				return toDiagnostic(issue, range, config, otherFiles, otherNonPrivateFiles);
 			})
@@ -320,7 +358,7 @@ function scopeLeakDiagnostic(
 	const live = affected.some(a => a.live);
 	const message =
 		`SCOPE LEAK: local variable '${issue.variable}' is assigned without being declared private, and overwrites ` +
-		`the caller's '${issue.variable}' when run via call from ${callerPath}${extra}. Call chain: ${formatChain(first.chain)}.` +
+		`the caller's '${issue.variable}' when run via call from ${callerPath}${extra}, and the modified variable gets read after that. Call chain: ${formatChain(first.chain)}.` +
 		(live ? '' : UNUSED_NOTE);
 
 	const diagnostic = new vscode.Diagnostic(

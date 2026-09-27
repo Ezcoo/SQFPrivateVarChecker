@@ -49,6 +49,9 @@ _speed = speed _unit;                  // assigned without being declared privat
     convention (also `compileFinal`, `preprocessFile`, `loadFile`, `compileScript`,
     nested forms like `compileFinal compile (...)`, and
     `missionNamespace setVariable ["anyName", compile ...]`),
+  - functions defined as a code block in any `.sqf` file: `anyName = {...};`,
+    `anyName = compileFinal {...};` or `missionNamespace setVariable ["anyName", {...}]`
+    (several per file is fine; each body is followed on its own),
   - `call compile preprocessFileLineNumbers "path\file.sqf"` directly,
   - local variables in the same file: `private _fnc = {...}; call _fnc` or
     `private _fnc = compile preprocessFileLineNumbers "file.sqf"; call _fnc`, as long
@@ -56,8 +59,10 @@ _speed = speed _unit;                  // assigned without being declared privat
     call is not certain, so it is not followed). Code blocks can call each other and
     global functions, and those chains are followed too.
 
-  Assignments inside code that runs elsewhere (`spawn {...}`, and code passed in arrays,
-  e.g. to `addEventHandler`) are not counted. Inline `call {...}` blocks are checked
+  Assignments inside code that runs elsewhere (`spawn {...}`, code passed in arrays,
+  e.g. to `addEventHandler`, and event handlers that take their code directly, such as
+  `addPublicVariableEventHandler {...}`, `onPlayerConnected {...}` or
+  `onMapSingleClick {...}`) are not counted. Inline `call {...}` blocks are checked
   like any other block in the file. Controlled by `detectScopeLeaks` and
   `scopeLeakSeverity` (`error` by default).
 
@@ -75,7 +80,20 @@ _speed = speed _unit;                  // assigned without being declared privat
     (`call _param`, `call compile _string`),
   - read by a function in between on the call chain after the call returns to it,
   - or the caller's own variable is not declared `private` at the top of its file or
-    code block, so it may belong to the caller's caller in turn.
+    code block, so it may belong to whoever calls *that* file in turn, and one of
+    those calls (found in the workspace, any number of calls up) reads it afterwards.
+    A file that is only run by `execVM`, `spawn` or an event handler takes its
+    variables with it.
+- **Several missions in one workspace** — a folder containing `description.ext` or
+  `mission.sqm` is a mission, and each `.sqf` file belongs to the nearest one above it.
+  A file with no such folder above it belongs to the nearest folder named like a
+  mission, `missionName.terrainName` (as Arma requires), so partial missions without
+  either file are kept apart too.
+  Files of different missions never run together, so a `call` is only followed into
+  functions of the caller's own mission (or files outside any mission, such as shared
+  or addon code), and the duplicate-name and high risk checks only compare files that
+  can meet. The same mission kept for several maps therefore does not report
+  collisions or leaks between its copies.
 - **Severity filtering** — `minimumSeverity` hides diagnostics below a chosen severity,
   in both the Problems panel and workspace scan summaries. For example, set it to
   `warning` to see warnings and errors but hide information/hint entries, or to `error`

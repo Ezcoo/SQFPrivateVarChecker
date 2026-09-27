@@ -1,13 +1,14 @@
 import * as assert from 'assert';
 import { analyzeFile } from '../analyzer/analyzer';
+import { MissionRoots } from '../missions';
 import { createPathResolver, FileFacts, findScopeLeaks, FunctionSource } from '../scopeLeaks';
 
 /** Builds the facts for a set of `path -> source` files, keyed by `file://` + path. */
 function workspace(sources: Record<string, string>): Map<string, FileFacts> {
 	const files = new Map<string, FileFacts>();
 	for (const [path, text] of Object.entries(sources)) {
-		const { issues, callSites, codeBlocks, flow } = analyzeFile(text);
-		files.set(`file://${path}`, { path, issues, callSites, codeBlocks, flow });
+		const { issues, callSites, codeBlocks, codeFunctions, flow } = analyzeFile(text);
+		files.set(`file://${path}`, { path, issues, callSites, codeBlocks, codeFunctions, flow });
 	}
 	return files;
 }
@@ -208,10 +209,13 @@ function liveness(result: ReturnType<typeof findScopeLeaks>): Record<string, boo
 	return out;
 }
 
-/** Liveness of `_count` when `caller` calls TAG_fnc_callee, which assigns `_count` without private. */
+/**
+ * Liveness of `_count` when `caller` (itself TAG_fnc_caller) calls TAG_fnc_callee, which assigns
+ * `_count` without private. Each `extra` file `/m/fn_name.sqf` is TAG_fnc_name.
+ */
 function countLiveness(caller: string, callee = '_count = 5;', extra: Record<string, string> = {}): boolean | undefined {
 	const files = workspace({ '/m/caller.sqf': caller, '/m/fn_callee.sqf': callee, ...extra });
-	const functions = [fn('TAG_fnc_callee', 'fn_callee.sqf')].concat(
+	const functions = [fn('TAG_fnc_callee', 'fn_callee.sqf'), fn('TAG_fnc_caller', 'caller.sqf')].concat(
 		Object.keys(extra).map(path => fn(`TAG_fnc_${path.slice(path.lastIndexOf('_') + 1, -4)}`, path.slice(3)))
 	);
 	return liveness(findScopeLeaks(files, functions))._count;
@@ -303,12 +307,57 @@ suite('findScopeLeaks - is the overwritten value read afterwards', () => {
 		);
 	});
 
+	test('not when a later call only compiles code written in place that does not mention it', () => {
+		const caller = 'private _count = 0;\ncall TAG_fnc_callee;\ncall TAG_fnc_send;';
+		const send = (code: string) => countLiveness(caller, '_count = 5;', { '/m/fn_send.sqf': code });
+		assert.strictEqual(send('private _pvf = _this;\nCall Compile Format ["TAG_PVF_%1 = _pvf;", _pvf select 1];'), false);
+		assert.strictEqual(send('call compile "hint str _count";'), true);
+		assert.strictEqual(send('call compile format ["hint str %1", _name];'), true);
+	});
+
 	test('when a later call cannot be followed', () => {
 		assert.strictEqual(countLiveness('params ["_code"];\nprivate _count = 0;\ncall TAG_fnc_callee;\ncall _code;'), true);
 	});
 
-	test('when the variable is not private itself, so it may be its own caller\'s', () => {
-		assert.strictEqual(countLiveness('_count = 0;\ncall TAG_fnc_callee;'), true);
+	test('when the variable is not private itself, only if a caller of this file reads it', () => {
+		const caller = '_count = 0;\ncall TAG_fnc_callee;';
+		// Nobody calls the caller: its variables go with it.
+		assert.strictEqual(countLiveness(caller), false);
+		assert.strictEqual(
+			countLiveness(caller, '_count = 5;', { '/m/fn_top.sqf': 'private _count = 1;\ncall TAG_fnc_caller;\nhint str _count;' }),
+			true
+		);
+		assert.strictEqual(
+			countLiveness(caller, '_count = 5;', { '/m/fn_top.sqf': 'private _count = 1;\ncall TAG_fnc_caller;' }),
+			false
+		);
+		// Any number of calls up, through callers that do not have the variable either.
+		assert.strictEqual(
+			countLiveness(caller, '_count = 5;', {
+				'/m/fn_middle.sqf': 'call TAG_fnc_caller;',
+				'/m/fn_top.sqf': 'private _count = 1;\ncall TAG_fnc_middle;\nhint str _count;'
+			}),
+			true
+		);
+	});
+
+	test('not when the file is only run by event handlers', () => {
+		// Server_BuildingHandleDamages.sqf in a real mission: `_ammo` is left out of its
+		// private list, but the file only ever runs as a handleDamage event handler.
+		const files = workspace({
+			'/m/init.sqf':
+				'_site addEventHandler ["handleDamage", {[_this select 0, _this select 2, _this select 3] call BuildingHandleDamages}];',
+			'/m/Server_BuildingHandleDamages.sqf':
+				'private ["_building", "_dammages"];\n' +
+				'_building = _this select 0;\n_dammages = _this select 1;\n_ammo = _this select 3;\n' +
+				'_dammages = [_building, _dammages, _ammo] call HandleBuildingDamage;\n_dammages',
+			'/m/Server_HandleBuildingDamage.sqf': 'private ["_building"];\n_ammo = _this select 2;\nswitch (_ammo) do {};'
+		});
+		const functions = [
+			fn('BuildingHandleDamages', 'Server_BuildingHandleDamages.sqf'),
+			fn('HandleBuildingDamage', 'Server_HandleBuildingDamage.sqf')
+		];
+		assert.deepStrictEqual(liveness(findScopeLeaks(files, functions)), { _ammo: false });
 	});
 
 	test('when a function in between on the call chain reads it after the call', () => {
@@ -346,6 +395,85 @@ suite('findScopeLeaks - is the overwritten value read afterwards', () => {
 		assert.deepStrictEqual(
 			affected.map(a => [a.callerKey, a.live]).sort(),
 			[['file:///m/unused.sqf', false], ['file:///m/used.sqf', true]]
+		);
+	});
+});
+
+suite('findScopeLeaks - functions defined as code blocks', () => {
+	test('a call to a function defined as TAG_fnc_foo = {...} runs its body', () => {
+		const files = workspace({
+			'/m/functions.sqf': 'TAG_fnc_other = { hint "x"; };\nTAG_fnc_count = {\n\t_count = 5;\n};',
+			'/m/caller.sqf': 'private _count = 0;\ncall TAG_fnc_count;\nhint str _count;'
+		});
+		const result = findScopeLeaks(files, []);
+		assert.deepStrictEqual(leakingCalls(result), { 'file:///m/caller.sqf': ['_count'] });
+		assert.deepStrictEqual(liveness(result), { _count: true });
+		const [affected] = [...result.writes.get('file:///m/functions.sqf')!.values()];
+		assert.deepStrictEqual(affected[0].chain, ['TAG_fnc_count']);
+	});
+
+	test('functions in the same file calling each other', () => {
+		const files = workspace({
+			'/m/functions.sqf':
+				'TAG_fnc_inner = { _result = 1; };\n' +
+				'TAG_fnc_outer = { private _result = 0; call TAG_fnc_inner; _result };\n' +
+				'TAG_fnc_safe = { private _unrelated = 0; call TAG_fnc_inner; };'
+		});
+		const result = findScopeLeaks(files, []);
+		assert.deepStrictEqual(leakingCalls(result), { 'file:///m/functions.sqf': ['_result'] });
+		assert.deepStrictEqual(liveness(result), { _result: true });
+	});
+
+	test('a later call to such a function can read the overwritten value', () => {
+		const caller = 'private _count = 0;\ncall TAG_fnc_callee;\ncall TAG_fnc_show;';
+		assert.strictEqual(countLiveness(caller, '_count = 5;', { '/m/show.sqf': 'TAG_fnc_show = { hint str _count; };' }), true);
+		assert.strictEqual(
+			countLiveness(caller, '_count = 5;', { '/m/show.sqf': 'TAG_fnc_show = { params ["_count"]; hint str _count; };' }),
+			false
+		);
+	});
+
+	test('a file that only defines functions does not leak by being run', () => {
+		const files = workspace({
+			'/m/init.sqf': 'private _count = 0;\ncall compile preprocessFileLineNumbers "functions.sqf";',
+			'/m/functions.sqf': 'TAG_fnc_count = { _count = 5; };'
+		});
+		assert.deepStrictEqual(leakingCalls(findScopeLeaks(files, [])), {});
+	});
+});
+
+suite('findScopeLeaks - several missions in one workspace', () => {
+	// The same mission for two maps, and code shared by both.
+	const files = () =>
+		workspace({
+			'/ws/chernarus/init.sqf': 'private _count = 0;\ncall TAG_fnc_count;\nhint str _count;',
+			'/ws/chernarus/functions.sqf': 'TAG_fnc_count = { _count = 1; };',
+			'/ws/lingor/init.sqf': 'private _count = 0;\ncall TAG_fnc_count;\ncall TAG_fnc_shared;\nhint str _count;',
+			'/ws/lingor/functions.sqf': 'TAG_fnc_count = { private _count = 1; };',
+			'/ws/shared/fn_shared.sqf': '_count = 2;'
+		});
+	const missions = new MissionRoots();
+	missions.add('/ws/chernarus/mission.sqm');
+	missions.add('/ws/lingor/mission.sqm');
+	const functions = [fn('TAG_fnc_shared', 'shared\\fn_shared.sqf')];
+
+	test('a call only runs functions of its own mission, or shared ones', () => {
+		const result = findScopeLeaks(files(), functions, (a, b) => missions.related(a, b));
+		assert.deepStrictEqual(leakingCalls(result), {
+			'file:///ws/chernarus/init.sqf': ['_count'],
+			'file:///ws/lingor/init.sqf': ['_count']
+		});
+		// Lingor's leak comes from the shared function, not from chernarus' TAG_fnc_count.
+		const [lingor] = result.calls.get('file:///ws/lingor/init.sqf')!;
+		assert.deepStrictEqual(lingor.names.get('_count')!.map(origin => origin.fileKey), ['file:///ws/shared/fn_shared.sqf']);
+	});
+
+	test('without missions, same-named functions of both are followed', () => {
+		const result = findScopeLeaks(files(), functions);
+		const lingor = result.calls.get('file:///ws/lingor/init.sqf')!;
+		assert.deepStrictEqual(
+			lingor.flatMap(call => call.names.get('_count')!.map(origin => origin.fileKey)).sort(),
+			['file:///ws/chernarus/functions.sqf', 'file:///ws/shared/fn_shared.sqf']
 		);
 	});
 });

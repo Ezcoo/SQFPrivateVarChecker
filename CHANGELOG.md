@@ -1,5 +1,39 @@
 # Changelog
 
+## [Unreleased]
+
+- Several missions in one workspace are kept apart: a folder with `description.ext`
+  or `mission.sqm` is a mission (failing that, the nearest folder named like one,
+  `missionName.terrainName`), calls are only followed into functions of the
+  caller's own mission (or code outside any mission), and the duplicate-name and high
+  risk checks only compare files of the same mission (or shared code).
+- Functions defined as `anyName = compileFinal {...}` or
+  `missionNamespace setVariable ["anyName", {...}]` (also with `compileFinal`, and
+  with further arguments) are followed too.
+
+- Functions defined as a code block, `anyName = {...};` (any name, any number per
+  file), are now followed by scope leak detection: calls to them run that block, so
+  leaks from them into their callers are reported, and a later call to one of them
+  counts as reading what its body reads.
+
+- `call compile "..."` and `call compile format ["...", ...]` with the code written in
+  place are no longer calls that "cannot be followed", which kept every scope leak
+  before such a call an error. The locals the string mentions count as read; a
+  `format` placeholder that could start a variable name of its own (`"%1 = 5"`) still
+  counts as unknown code.
+
+- A scope leak into a caller's variable that is not declared `private` either is no
+  longer always an error: the calls that run the caller are followed up in turn, and
+  it is an error only if one of them reads the variable afterwards. A file that is
+  only run by `execVM`, `spawn` or an event handler takes its variables with it.
+- Code given directly to an event handler command (`addPublicVariableEventHandler`,
+  `onPlayerConnected`, `onPlayerDisconnected`, `onMapSingleClick`, `onPreloadStarted`,
+  `onPreloadFinished`, `onTeamSwitch`, `onCommandModeChanged`,
+  `onHCGroupSelectionChanged`, `onGroupIconClick`, `onGroupIconOverEnter`,
+  `onGroupIconOverLeave`) now counts as running in a scope of its own, like `spawn`.
+  Its assignments no longer show up as scope leaks into the caller, and calls made in
+  it no longer see the enclosing script's variables.
+
 ## [0.3.1]
 
 - Scope leaks whose overwritten variable is never read afterwards (by the caller, by

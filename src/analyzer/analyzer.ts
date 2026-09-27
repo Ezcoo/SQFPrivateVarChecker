@@ -110,10 +110,21 @@ export interface LocalWrite {
 	end: number;
 }
 
-/** A `{...}` stored in a local variable, which `call _fnc` runs in the caller's scope. */
+/**
+ * A `{...}` stored in a variable: a local one (`private _fnc = {...}; call _fnc`) or a
+ * global function (`TAG_fnc_foo = {...}`), which `call` runs in the caller's scope.
+ */
 export interface CodeBlock {
 	/** First assignment of each name that the block does not declare itself, so it reaches the block's caller. */
 	writes: LocalWrite[];
+}
+
+/** `TAG_fnc_foo = {...}`: a global function whose body is a code block in this file. */
+export interface CodeFunction {
+	/** Lowercased function name. */
+	name: string;
+	/** Index into `codeBlocks`. */
+	block: number;
 }
 
 /** `TAG_fnc_foo = compile preprocessFileLineNumbers "foo.sqf"` and similar. */
@@ -143,6 +154,8 @@ export interface AnalyzeResult {
 	callSites: CallSite[];
 	/** Global functions this file defines by compiling another file. */
 	compiledFunctions: CompiledFunction[];
+	/** Global functions this file defines as a code block (`TAG_fnc_foo = {...}`). */
+	codeFunctions: CodeFunction[];
 	/** Code blocks stored in local variables, referenced by `CallTarget` and `CallSite.codeBlock`. */
 	codeBlocks: CodeBlock[];
 	/** Reads and writes of local variables, to tell whether a value is used after a call (see `flow.ts`). */
@@ -179,8 +192,29 @@ export const DEFAULT_MAGIC_VARIABLES = [
 
 const COMPILE_COMMANDS = new Set(['compile', 'compilefinal', 'compilescript']);
 const PREPROCESS_COMMANDS = new Set(['preprocessfilelinenumbers', 'preprocessfile', 'loadfile']);
-/** Commands whose `{...}` argument runs somewhere else than the current scope. */
-const DETACHING_COMMANDS = new Set(['spawn', 'oneachframe', 'compilefinal']);
+/**
+ * Commands whose `{...}` argument runs somewhere else than the current scope: in a
+ * scope of its own, or later, when an event fires. Event handlers that take their code
+ * inside an array (`addEventHandler ["Killed", {...}]`) are covered by the array rule
+ * in `opensDetachedBlock`; these take it directly.
+ */
+const DETACHING_COMMANDS = new Set([
+	'spawn',
+	'oneachframe',
+	'compilefinal',
+	'addpublicvariableeventhandler',
+	'onplayerconnected',
+	'onplayerdisconnected',
+	'onmapsingleclick',
+	'onpreloadstarted',
+	'onpreloadfinished',
+	'onteamswitch',
+	'oncommandmodechanged',
+	'onhcgroupselectionchanged',
+	'ongroupiconclick',
+	'ongroupiconoverenter',
+	'ongroupiconoverleave'
+]);
 /** Commands whose `{...}` argument runs at most once, in place. */
 const RUN_ONCE_COMMANDS = new Set(['then', 'else', 'exitwith', 'try', 'catch', 'call', 'isnil', 'default']);
 /** Statements whose `do {...}` block runs at most once. */
@@ -234,6 +268,7 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 	const occurrences: NameOccurrence[] = [];
 	const callSites: CallSite[] = [];
 	const compiledFunctions: CompiledFunction[] = [];
+	const codeFunctions: CodeFunction[] = [];
 	// For each open `[`, whether it is the `then [{...}, {...}]` form, whose blocks
 	// run in place like ordinary `then {...} else {...}` blocks.
 	const arrays: boolean[] = [];
@@ -429,8 +464,11 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 				owners
 			};
 			const callee = tokens[i + 1];
-			// Inline code is part of this file, so its reads and writes are seen directly.
-			if (!(callee?.type === 'symbol' && callee.value === '{')) {
+			// Inline code is part of this file, so its reads and writes are seen directly;
+			// so is code compiled from a string written right here (its names are read
+			// events of the string).
+			const inline = (callee?.type === 'symbol' && callee.value === '{') || compilesVisibleCode(tokens, i + 1);
+			if (!inline) {
 				events.push({ kind: 'call', offset: token.start, scope: currentScope() });
 			}
 			if (callee?.type === 'ident' && isLocalVariableName(callee.value)) {
@@ -453,6 +491,17 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 			if (name && compiled) {
 				compiledFunctions.push({ name: name.toLowerCase(), path: compiled.path });
 			}
+			continue;
+		}
+
+		// `TAG_fnc_foo = {...}`, `TAG_fnc_foo = compileFinal {...}` and
+		// `missionNamespace setVariable ["TAG_fnc_foo", {...}]` define a function; its body
+		// only runs when it is called.
+		const definition = readCodeFunctionDefinition(tokens, i);
+		if (definition) {
+			codeBlocks.push({ writes: [] });
+			codeBlockStarts.set(definition.brace, codeBlocks.length - 1);
+			codeFunctions.push({ name: definition.name.toLowerCase(), block: codeBlocks.length - 1 });
 			continue;
 		}
 
@@ -521,6 +570,7 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 		nonPrivateNames,
 		callSites,
 		compiledFunctions,
+		codeFunctions,
 		codeBlocks,
 		flow: { scopes: flowScopes, events }
 	};
@@ -550,6 +600,81 @@ function mayRepeat(tokens: Token[], index: number, arrays: boolean[]): boolean {
 		}
 	}
 	return true;
+}
+
+/**
+ * Reads a global function defined as a code block, starting at the token at `index`:
+ * `anyName = {...}` or `anyName = compileFinal {...}` (at the name), or
+ * `missionNamespace setVariable ["anyName", {...}]`, also with `compileFinal {...}` and
+ * further arguments (at `setVariable`). Returns the name and the index of the `{`.
+ */
+function readCodeFunctionDefinition(tokens: Token[], index: number): { name: string; brace: number } | undefined {
+	const token = tokens[index];
+	const isSymbol = (i: number, value: string) => tokens[i]?.type === 'symbol' && tokens[i].value === value;
+	// The `{`, possibly after `compileFinal`, starting at `i`.
+	const braceAt = (i: number) => {
+		if (tokens[i]?.type === 'ident' && tokens[i].value.toLowerCase() === 'compilefinal') {
+			i++;
+		}
+		return isSymbol(i, '{') ? i : undefined;
+	};
+	if (token.type !== 'ident' || token.value.startsWith('_')) {
+		return undefined;
+	}
+
+	if (isSymbol(index + 1, '=')) {
+		const brace = braceAt(index + 2);
+		return brace === undefined ? undefined : { name: token.value, brace };
+	}
+
+	const namespace = tokens[index - 1];
+	const name = tokens[index + 2];
+	if (
+		token.value.toLowerCase() === 'setvariable' &&
+		namespace?.type === 'ident' &&
+		namespace.value.toLowerCase() === 'missionnamespace' &&
+		isSymbol(index + 1, '[') &&
+		name?.type === 'string' &&
+		name.value.trim().length > 0 &&
+		!name.value.trim().startsWith('_') &&
+		isSymbol(index + 3, ',')
+	) {
+		const brace = braceAt(index + 4);
+		return brace === undefined ? undefined : { name: name.value.trim(), brace };
+	}
+	return undefined;
+}
+
+/**
+ * Whether the tokens at `index` compile code whose text is all here:
+ * `compile "..."` or `compile format ["...", ...]` (any `compile` command, with or
+ * without parentheses). With `format`, every `%1` placeholder must continue a name
+ * (`"TAG_%1 = _a"`): one that could start a name of its own could be filled in with a
+ * local variable's name.
+ */
+function compilesVisibleCode(tokens: Token[], index: number): boolean {
+	let i = index;
+	if (!(tokens[i]?.type === 'ident' && COMPILE_COMMANDS.has(tokens[i].value.toLowerCase()))) {
+		return false;
+	}
+	i++;
+	while (tokens[i]?.type === 'symbol' && tokens[i].value === '(') {
+		i++;
+	}
+	if (tokens[i]?.type === 'string') {
+		return true;
+	}
+	if (!(tokens[i]?.type === 'ident' && tokens[i].value.toLowerCase() === 'format')) {
+		return false;
+	}
+	i++;
+	while (tokens[i]?.type === 'symbol' && tokens[i].value === '(') {
+		i++;
+	}
+	if (!(tokens[i]?.type === 'symbol' && tokens[i].value === '[' && tokens[i + 1]?.type === 'string')) {
+		return false;
+	}
+	return !/(?<![A-Za-z0-9_])%\d/.test(tokens[i + 1].value);
 }
 
 /** Index of the first token of the statement containing the token at `index`. */
