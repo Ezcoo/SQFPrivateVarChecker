@@ -43,9 +43,12 @@ _speed = speed _unit;                  // assigned without being declared privat
   The call is underlined in the editor too, with the details on hover, but only the
   assignment is listed in the Problems view, with the affected calls under it.
   Callees are resolved from:
-  - `CfgFunctions` in `description.ext` or `CfgFunctions.hpp` (including the default
-    `functions\Category\fn_name.sqf` paths, category and function `file` attributes,
-    and `tag` overrides),
+  - `CfgFunctions` in `description.ext`, an addon's `config.cpp` or `CfgFunctions.hpp`
+    (including the default `functions\Category\fn_name.sqf` paths, category and
+    function `file` attributes such as `file = "\mymod\addons\core\functions"`, and
+    `tag` overrides). Files they `#include` are read too, whatever their name, as long
+    as the path is relative to the including file (`#include "cfg\functions.hpp"`, not
+    `#include "\x\mymod\addons\main\functions.hpp"`),
   - `anyName = compile preprocessFileLineNumbers "path\file.sqf"` in any `.sqf` file:
     the name is whatever is assigned to and need not follow the `TAG_fnc_name`
     convention (also `compileFinal`, `preprocessFile`, `loadFile`, `compileScript`,

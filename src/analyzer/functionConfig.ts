@@ -14,9 +14,70 @@ interface ConfigClass {
 	classes: ConfigClass[];
 }
 
+/** `#include "file"` or `#include <file>` on a line of its own. */
+const INCLUDE_DIRECTIVE = /^[ \t]*#[ \t]*include[ \t]*["<]([^">\r\n]+)[">][^\r\n]*$/gm;
+/** How deep `#include`s are followed, against runaway nesting. */
+const MAX_INCLUDE_DEPTH = 16;
+
+/**
+ * Replaces each `#include` in `text` (the file at `path`, a `/`-separated path) with
+ * the contents of the file it names, recursively, the way the preprocessor does, so
+ * that a `CfgFunctions` block spread over several files can be parsed as one. Paths
+ * are relative to the including file; one that starts with `\` (an addon path, such
+ * as `\x\cba\addons\main\script_macros.hpp`) is left out, as is anything `read` cannot
+ * find (it returns undefined) and a file that includes itself.
+ *
+ * Returns the expanded text and the path of every file it tried to include (found or
+ * not, so that creating a missing one can be noticed too).
+ */
+export async function expandIncludes(
+	text: string,
+	path: string,
+	read: (path: string) => Promise<string | undefined>
+): Promise<{ text: string; included: string[] }> {
+	const included = new Set<string>();
+	const expand = async (source: string, from: string, stack: string[]): Promise<string> => {
+		const parts: string[] = [];
+		let last = 0;
+		for (const match of source.matchAll(INCLUDE_DIRECTIVE)) {
+			parts.push(source.slice(last, match.index));
+			last = match.index + match[0].length;
+			const target = resolveInclude(from, match[1]);
+			if (target === undefined || stack.includes(target) || stack.length >= MAX_INCLUDE_DEPTH) {
+				continue;
+			}
+			included.add(target);
+			const content = await read(target);
+			if (content !== undefined) {
+				parts.push(await expand(content, target, [...stack, target]));
+			}
+		}
+		parts.push(source.slice(last));
+		return parts.join('');
+	};
+	return { text: await expand(text, path, [path]), included: [...included] };
+}
+
+/** The path that `#include "name"` in the file at `from` refers to, or undefined for an addon path. */
+function resolveInclude(from: string, name: string): string | undefined {
+	const normalized = name.trim().replace(/\\/g, '/');
+	if (normalized.startsWith('/')) {
+		return undefined;
+	}
+	const segments = from.split('/').slice(0, -1);
+	for (const segment of normalized.split('/')) {
+		if (segment === '..') {
+			segments.pop();
+		} else if (segment !== '.' && segment !== '') {
+			segments.push(segment);
+		}
+	}
+	return segments.join('/');
+}
+
 /**
  * Lists the functions declared in a `CfgFunctions` block, as found in
- * `description.ext` or a `CfgFunctions.hpp`. The latter is often `#include`d from
+ * `description.ext`, an addon's `config.cpp` or a `CfgFunctions.hpp`. The latter is often `#include`d from
  * inside `class CfgFunctions { ... };` in description.ext, so when a file has no
  * `CfgFunctions` class of its own and `bareTags` is true, its top-level classes are
  * read as the tags.

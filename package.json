@@ -3,7 +3,7 @@
   "displayName": "SQF Private Variable Checker",
   "publisher": "Ezcoo",
   "description": "Checks all local variables and informs the user if there are issues with variable scopes, from minor issues to very high risk variables.",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "icon": "resources/icon.png",
   "repository": {
     "type": "git",
@@ -121,7 +121,7 @@
         "sqfPrivateVariableChecker.detectScopeLeaks": {
           "type": "boolean",
           "default": true,
-          "description": "Follow call chains across files (functions from CfgFunctions.hpp, description.ext, `anyName = compile preprocessFileLineNumbers \"file.sqf\"`, or a local `private _fnc = {...}` assigned once in the same file) and report non-private assignments that overwrite a local variable of a caller, however many calls up the chain it is."
+          "description": "Follow call chains across files (functions from CfgFunctions in description.ext, config.cpp, CfgFunctions.hpp and the files they #include, `anyName = compile preprocessFileLineNumbers \"file.sqf\"`, or a local `private _fnc = {...}` assigned once in the same file) and report non-private assignments that overwrite a local variable of a caller, however many calls up the chain it is."
         },
         "sqfPrivateVariableChecker.scopeLeakSeverity": {
           "type": "string",

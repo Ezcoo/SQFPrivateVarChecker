@@ -10,7 +10,7 @@ import {
 	SqfIssue
 } from './analyzer/analyzer';
 import { CallSiteMark, CallSiteMarks } from './callSiteMarks';
-import { parseCfgFunctions } from './analyzer/functionConfig';
+import { expandIncludes, parseCfgFunctions } from './analyzer/functionConfig';
 import { CheckerConfig, readConfig } from './config';
 import { MissionRoots } from './missions';
 import { AffectedCaller, findScopeLeaks, FunctionSource, LeakingCall, LeakKind, ScopeLeakResult } from './scopeLeaks';
@@ -59,14 +59,21 @@ const intentionalNote = (variable: string) =>
 /** How long to wait after the last file change before re-following call chains. */
 const SCOPE_LEAK_DEBOUNCE_MS = 250;
 
+function decode(bytes: Uint8Array): string {
+	return new TextDecoder().decode(bytes);
+}
+
 export function isSqfDocument(document: vscode.TextDocument): boolean {
 	return document.languageId === 'sqf' || document.uri.path.toLowerCase().endsWith('.sqf');
 }
 
-/** `description.ext` and `CfgFunctions.hpp`, the files `CfgFunctions` is read from. */
+/**
+ * `description.ext`, an addon's `config.cpp` and `CfgFunctions.hpp`, the files
+ * `CfgFunctions` is read from (together with the files they `#include`).
+ */
 export function isFunctionConfigFile(uri: vscode.Uri): boolean {
 	const baseName = uri.path.slice(uri.path.lastIndexOf('/') + 1).toLowerCase();
-	return baseName === 'description.ext' || baseName === 'cfgfunctions.hpp';
+	return baseName === 'description.ext' || baseName === 'config.cpp' || baseName === 'cfgfunctions.hpp';
 }
 
 interface FileState {
@@ -93,8 +100,10 @@ export class SqfDiagnostics implements vscode.Disposable {
 	/** Mission folders, so that several missions in one workspace are kept apart. */
 	private readonly missions = new MissionRoots();
 	private readonly files = new Map<string, FileState>();
-	/** Functions declared in each `description.ext` / `CfgFunctions.hpp`, by file key. */
+	/** Functions declared in each `description.ext` / `config.cpp` / `CfgFunctions.hpp`, by file key. */
 	private readonly configFunctions = new Map<string, FunctionSource[]>();
+	/** The files each of those `#include`s, by file key, so that editing one re-reads it. */
+	private readonly configIncludes = new Map<string, Set<string>>();
 	private leaks: ScopeLeakResult = NO_LEAKS;
 	private leakTimer: NodeJS.Timeout | undefined;
 
@@ -114,6 +123,7 @@ export class SqfDiagnostics implements vscode.Disposable {
 		this.callMarks.clear();
 		this.files.clear();
 		this.configFunctions.clear();
+		this.configIncludes.clear();
 		this.index.clear();
 		this.missions.clear();
 		this.leaks = NO_LEAKS;
@@ -129,13 +139,32 @@ export class SqfDiagnostics implements vscode.Disposable {
 		return this.callMarks.get(uri);
 	}
 
-	/** Re-reads the functions declared in a `description.ext` or `CfgFunctions.hpp` on disk. */
+	/**
+	 * Re-reads the functions declared in a `description.ext`, `config.cpp` or
+	 * `CfgFunctions.hpp` on disk, and in the files it `#include`s.
+	 */
 	async refreshFunctionConfig(uri: vscode.Uri): Promise<void> {
-		const text = new TextDecoder().decode(await vscode.workspace.fs.readFile(uri));
-		const bareTags = !uri.path.toLowerCase().endsWith('.ext');
+		const read = async (path: string) => {
+			try {
+				return decode(await vscode.workspace.fs.readFile(uri.with({ path })));
+			} catch {
+				return undefined;
+			}
+		};
+		const { text, included } = await expandIncludes(decode(await vscode.workspace.fs.readFile(uri)), uri.path, read);
+		const bareTags = uri.path.toLowerCase().endsWith('.hpp');
 		const functions = parseCfgFunctions(text, bareTags).map(fn => ({ ...fn, definedIn: uri.path }));
 		this.configFunctions.set(uri.toString(), functions);
+		this.configIncludes.set(uri.toString(), new Set(included.map(path => uri.with({ path }).toString())));
 		this.scheduleScopeLeaks();
+	}
+
+	/** The function configs that `#include` the file at `uri`, and so must be re-read when it changes. */
+	functionConfigsIncluding(uri: vscode.Uri): vscode.Uri[] {
+		const key = uri.toString();
+		return [...this.configIncludes]
+			.filter(([, included]) => included.has(key))
+			.map(([config]) => vscode.Uri.parse(config));
 	}
 
 	/**
@@ -158,6 +187,7 @@ export class SqfDiagnostics implements vscode.Disposable {
 	}
 
 	deleteFunctionConfig(uri: vscode.Uri): void {
+		this.configIncludes.delete(uri.toString());
 		if (this.configFunctions.delete(uri.toString())) {
 			this.scheduleScopeLeaks();
 		}

@@ -6,8 +6,10 @@ import { CallSiteMark } from './callSiteMarks';
 import { AddPrivateQuickFix } from './quickFix';
 
 const DEBOUNCE_MS = 300;
-/** Candidates for `description.ext` and `CfgFunctions.hpp`; filtered by `isFunctionConfigFile`. */
-const FUNCTION_CONFIG_GLOB = '**/*.{ext,hpp,EXT,HPP}';
+/** Candidates for `description.ext`, `config.cpp` and `CfgFunctions.hpp`; filtered by `isFunctionConfigFile`. */
+const FUNCTION_CONFIG_GLOB = '**/*.{ext,cpp,hpp,EXT,CPP,HPP}';
+/** Files a function config may `#include`, watched so that editing one re-reads the configs that include it. */
+const CONFIG_INCLUDE_GLOB = '**/*.{ext,cpp,hpp,h,hh,inc,EXT,CPP,HPP,H,HH,INC}';
 /** Candidates for `description.ext` and `mission.sqm`, which mark a mission folder; filtered by `MissionRoots.isMarker`. */
 const MISSION_MARKER_GLOB = '**/*.{ext,sqm,EXT,SQM}';
 
@@ -84,17 +86,25 @@ export function activate(context: vscode.ExtensionContext): SqfCheckerApi {
 	);
 
 	// Functions declared in CfgFunctions, for following `call` chains across files.
-	const configWatcher = vscode.workspace.createFileSystemWatcher(FUNCTION_CONFIG_GLOB);
+	const configWatcher = vscode.workspace.createFileSystemWatcher(CONFIG_INCLUDE_GLOB);
 	const refreshConfig = (uri: vscode.Uri) => {
+		diagnostics.refreshFunctionConfig(uri).catch(() => diagnostics.deleteFunctionConfig(uri));
+	};
+	// A config itself, or a file some config includes.
+	const refreshConfigs = (uri: vscode.Uri) => {
 		if (isFunctionConfigFile(uri)) {
-			diagnostics.refreshFunctionConfig(uri).catch(() => diagnostics.deleteFunctionConfig(uri));
+			refreshConfig(uri);
 		}
+		diagnostics.functionConfigsIncluding(uri).forEach(refreshConfig);
 	};
 	context.subscriptions.push(
 		configWatcher,
-		configWatcher.onDidCreate(refreshConfig),
-		configWatcher.onDidChange(refreshConfig),
-		configWatcher.onDidDelete(uri => diagnostics.deleteFunctionConfig(uri))
+		configWatcher.onDidCreate(refreshConfigs),
+		configWatcher.onDidChange(refreshConfigs),
+		configWatcher.onDidDelete(uri => {
+			diagnostics.functionConfigsIncluding(uri).forEach(refreshConfig);
+			diagnostics.deleteFunctionConfig(uri);
+		})
 	);
 
 	// Mission folders, so that several missions in one workspace are kept apart.
@@ -188,7 +198,7 @@ async function indexMissions(diagnostics: SqfDiagnostics, exclude: string | null
 	}
 }
 
-/** Reads every `description.ext` and `CfgFunctions.hpp` in the workspace. */
+/** Reads every `description.ext`, `config.cpp` and `CfgFunctions.hpp` in the workspace. */
 async function indexFunctionConfigs(diagnostics: SqfDiagnostics, exclude: string | null): Promise<void> {
 	const files = await vscode.workspace.findFiles(FUNCTION_CONFIG_GLOB, exclude ?? undefined);
 	for (const uri of files.filter(isFunctionConfigFile)) {

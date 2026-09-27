@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+- Functions declared in an addon's `config.cpp` are followed too, so mods get scope
+  leak detection across their own functions. `#include`s in `description.ext`,
+  `config.cpp` and `CfgFunctions.hpp` are followed (relative paths, any file name),
+  and editing an included file re-reads the configs that include it.
+
 ## [0.4.0]
 
 - Scope leaks follow `switch` cases: an assignment in a `case` of a switch on the
