@@ -499,3 +499,221 @@ suite('createPathResolver', () => {
 		assert.strictEqual(resolve('elsewhere\\fnc_bar.sqf', '/ws/x.sqf'), undefined);
 	});
 });
+
+suite('findScopeLeaks - harmless and deliberate leaks', () => {
+	/** The kind of the leak of `name` from `/m/fn_callee.sqf` into `/m/caller.sqf`. */
+	function kindOf(caller: string, callee: string, name: string, extra: Record<string, string> = {}) {
+		const files = workspace({ '/m/caller.sqf': caller, '/m/fn_callee.sqf': callee, ...extra });
+		const functions = [fn('TAG_fnc_callee', 'fn_callee.sqf'), ...Object.keys(extra).map(path => fn(`TAG_fnc_${path.slice(3, -4)}`, path.slice(3)))];
+		const result = findScopeLeaks(files, functions);
+		const [affected] = [...result.writes.get('file:///m/fn_callee.sqf')!.values()];
+		const origin = result.calls.get('file:///m/caller.sqf')![0].names.get(name)![0];
+		assert.strictEqual(origin.kind, affected[0].kind);
+		return affected[0].kind;
+	}
+
+	test('same value: the callee only assigns what the call passes in for it', () => {
+		const caller = 'private _id = 1;\n[_id, 5] call TAG_fnc_callee;\nhint str _id;';
+		assert.strictEqual(kindOf(caller, '_id = _this select 0;\nhint str _id;', '_id'), 'same-value');
+		assert.strictEqual(kindOf(caller, '_id = (_this # 0);\nhint str _id;', '_id'), 'same-value');
+		assert.strictEqual(
+			kindOf('private _id = 1;\n_id call TAG_fnc_callee;\nhint str _id;', '_id = _this;\nhint str _id;', '_id'),
+			'same-value'
+		);
+	});
+
+	test('not the same value when passed elsewhere, changed, or assigned again', () => {
+		const read = '\nhint str _id;';
+		assert.strictEqual(kindOf('private _id = 1;\n[5, _id] call TAG_fnc_callee;' + read, '_id = _this select 0;' + read, '_id'), undefined);
+		assert.strictEqual(kindOf('private _id = 1;\n[_id] call TAG_fnc_callee;' + read, '_id = round (_this select 0);' + read, '_id'), undefined);
+		assert.strictEqual(
+			kindOf('private _id = 1;\n[_id] call TAG_fnc_callee;' + read, '_id = _this select 0;\n_id = _id + 1;' + read, '_id'),
+			undefined
+		);
+	});
+
+	test('intentional: the caller does not use its value before the call, and the callee never reads it back', () => {
+		const caller = 'private _done = false;\ncall TAG_fnc_callee;\nif (_done) then { hint "done"; };';
+		assert.strictEqual(kindOf(caller, 'if (x) then { _done = true; };', '_done'), 'intentional');
+		// Code before the value is set does not count.
+		assert.strictEqual(kindOf('hint str _done;\n' + caller, '_done = true;', '_done'), 'intentional');
+	});
+
+	test('not intentional when the caller uses its value before the call', () => {
+		const caller = 'private _done = false;\nhint str _done;\ncall TAG_fnc_callee;\nhint str _done;';
+		assert.strictEqual(kindOf(caller, '_done = true;', '_done'), undefined);
+		// Also through a call in between that reads it, or cannot be followed.
+		const between = (call: string) => `private _done = false;\n${call}\ncall TAG_fnc_callee;\nhint str _done;`;
+		assert.strictEqual(kindOf(between('call TAG_fnc_show;'), '_done = true;', '_done', { '/m/show.sqf': 'hint str _done;' }), undefined);
+		assert.strictEqual(kindOf(between('call TAG_fnc_show;'), '_done = true;', '_done', { '/m/show.sqf': 'hint "x";' }), 'intentional');
+		assert.strictEqual(kindOf('params ["_code"];\n' + between('call _code;'), '_done = true;', '_done'), undefined);
+	});
+
+	test('not intentional when the callee reads back what it assigns', () => {
+		const caller = 'private _done = false;\ncall TAG_fnc_callee;\nhint str _done;';
+		assert.strictEqual(kindOf(caller, '_done = true;\nhint str _done;', '_done'), undefined);
+		// In a loop, a read before the assignment comes after it on the next round.
+		assert.strictEqual(kindOf(caller, 'while {x} do {\n\tif (_done) exitWith {};\n\t_done = true;\n};', '_done'), undefined);
+		// Or by a function it calls afterwards.
+		assert.strictEqual(
+			kindOf(caller, '_done = true;\ncall TAG_fnc_show;', '_done', { '/m/show.sqf': 'hint str _done;' }),
+			undefined
+		);
+	});
+
+	test('only a leak straight from the called function is classified', () => {
+		const files = workspace({
+			'/m/a.sqf': 'private _done = false;\ncall TAG_fnc_b;\nhint str _done;',
+			'/m/b.sqf': 'call TAG_fnc_d;',
+			'/m/d.sqf': '_done = true;'
+		});
+		const result = findScopeLeaks(files, [fn('TAG_fnc_b', 'b.sqf'), fn('TAG_fnc_d', 'd.sqf')]);
+		const [affected] = [...result.writes.get('file:///m/d.sqf')!.values()];
+		assert.strictEqual(affected[0].kind, undefined);
+	});
+
+	test('a shared comment in the callee is no leak at all', () => {
+		const files = workspace({
+			'/m/caller.sqf': 'private _count = 0;\ncall TAG_fnc_callee;\nhint str _count;',
+			'/m/fn_callee.sqf': '// sqf-private: shared _count\n_count = _count + 1;'
+		});
+		assert.deepStrictEqual(leakingCalls(findScopeLeaks(files, [fn('TAG_fnc_callee', 'fn_callee.sqf')])), {});
+	});
+});
+
+suite('findScopeLeaks - branches that never both run', () => {
+	const call = 'call TAG_fnc_callee;';
+
+	test('not when it is only read in the other branch of an if', () => {
+		assert.strictEqual(countLiveness(`private _count = 0;\nif (a) then { ${call} } else { hint str _count; };`), false);
+		assert.strictEqual(countLiveness(`private _count = 0;\nif (a) then { hint str _count; } else { ${call} };`), false);
+		assert.strictEqual(countLiveness(`private _count = 0;\nif (a) then [{ ${call} }, { hint str _count; }];`), false);
+		// After the if statement, it runs whichever branch was taken.
+		assert.strictEqual(
+			countLiveness(`private _count = 0;\nif (a) then { ${call} } else { hint str _count; };\nhint str _count;`),
+			true
+		);
+	});
+
+	test('not when it is only read in another case of a switch', () => {
+		assert.strictEqual(
+			countLiveness(
+				`private _count = 0;\nswitch (a) do {\n\tcase 1: { ${call} };\n\tcase 2: { hint str _count; };\n\tdefault { hint str _count; };\n};`
+			),
+			false
+		);
+	});
+
+	test('when a loop around the if can run the other branch next', () => {
+		const body = `if (b) then { ${call} } else { hint str _count; };`;
+		assert.strictEqual(countLiveness(`private _count = 0;\nwhile {a} do { ${body} };`), true);
+		// Unless the variable itself only lives for one round.
+		assert.strictEqual(countLiveness(`while {a} do { private _count = 0; ${body} };`), false);
+	});
+
+	test('not when an exitWith block leaves the scope before the read', () => {
+		assert.strictEqual(
+			countLiveness(`private _count = 0;\nif (x) then {\n\tif (a) exitWith { ${call} };\n\thint str _count;\n};`),
+			false
+		);
+		// It only leaves the then block: what comes after that still runs.
+		assert.strictEqual(
+			countLiveness(`private _count = 0;\nif (x) then {\n\tif (a) exitWith { ${call} };\n\thint str _count;\n};\nhint str _count;`),
+			true
+		);
+	});
+
+	test('not when an exitWith block leaves the loop it is in', () => {
+		const loop = `private _count = 0;\nwhile {a} do {\n\thint str _count;\n\tif (b) exitWith { ${call} };\n};`;
+		assert.strictEqual(countLiveness(loop), false);
+		assert.strictEqual(countLiveness(`${loop}\nhint str _count;`), true);
+	});
+
+	test('try and catch are not alternatives: the catch block can run after the call', () => {
+		assert.strictEqual(countLiveness(`private _count = 0;\ntry { ${call} } catch { hint str _count; };`), true);
+	});
+
+	test('a read in another branch does not stop a leak from looking intentional', () => {
+		const files = workspace({
+			'/m/caller.sqf':
+				'private _done = false;\nif (a) then { hint str _done; } else { call TAG_fnc_callee; };\nhint str _done;',
+			'/m/fn_callee.sqf': 'if (b) then { _done = true; } else { hint str _done; };'
+		});
+		const result = findScopeLeaks(files, [fn('TAG_fnc_callee', 'fn_callee.sqf')]);
+		const [affected] = [...result.writes.get('file:///m/fn_callee.sqf')!.values()];
+		assert.strictEqual(affected[0].kind, 'intentional');
+	});
+});
+
+suite('findScopeLeaks - switch cases', () => {
+	const callee =
+		'private _message = _this select 0;\nswitch (_message) do {\n\tcase "build": { _var = 1; };\n\tcase "town": { hint "town"; };\n\tdefault { _other = 1; };\n};';
+	const leaks = (caller: string, body = callee) => {
+		const files = workspace({ '/m/caller.sqf': caller, '/m/fn_callee.sqf': body });
+		return leakingCalls(findScopeLeaks(files, [fn('TAG_fnc_callee', 'fn_callee.sqf')]));
+	};
+
+	test('no leak from a case that the call does not select', () => {
+		assert.deepStrictEqual(leaks('private _var = 0;\nprivate _other = 0;\n["town", [1]] call TAG_fnc_callee;\nhint str [_var, _other];'), {});
+		assert.deepStrictEqual(leaks('private _var = 0;\n["TOWN"] call TAG_fnc_callee;\nhint str _var;'), {});
+	});
+
+	test('a leak from the case that the call selects, or from default', () => {
+		assert.deepStrictEqual(leaks('private _var = 0;\n["Build"] call TAG_fnc_callee;\nhint str _var;'), {
+			'file:///m/caller.sqf': ['_var']
+		});
+		assert.deepStrictEqual(leaks('private _other = 0;\n["spot"] call TAG_fnc_callee;\nhint str _other;'), {
+			'file:///m/caller.sqf': ['_other']
+		});
+	});
+
+	test('a leak from every case when the value passed is not a literal', () => {
+		assert.deepStrictEqual(leaks('private _var = 0;\n[_kind] call TAG_fnc_callee;\nhint str _var;'), {
+			'file:///m/caller.sqf': ['_var']
+		});
+		assert.deepStrictEqual(leaks('private _var = 0;\n_args call TAG_fnc_callee;\nhint str _var;'), {
+			'file:///m/caller.sqf': ['_var']
+		});
+	});
+
+	test('the case is chosen by the call into the switching function, further up the chain too', () => {
+		const files = workspace({
+			'/m/caller.sqf': 'private _var = 0;\ncall TAG_fnc_middle;\nhint str _var;',
+			'/m/fn_middle.sqf': '["town"] call TAG_fnc_callee;',
+			'/m/fn_callee.sqf': callee
+		});
+		const functions = [fn('TAG_fnc_callee', 'fn_callee.sqf'), fn('TAG_fnc_middle', 'fn_middle.sqf')];
+		assert.deepStrictEqual(leakingCalls(findScopeLeaks(files, functions)), {});
+		files.set('file:///m/fn_middle.sqf', workspace({ '/m/fn_middle.sqf': '["build"] call TAG_fnc_callee;' }).get('file:///m/fn_middle.sqf')!);
+		assert.deepStrictEqual(leakingCalls(findScopeLeaks(files, functions)), { 'file:///m/caller.sqf': ['_var'] });
+	});
+});
+
+suite('findScopeLeaks - reads that the caller\'s own assignment comes before', () => {
+	const call = 'call TAG_fnc_callee;';
+
+	test('not when the caller assigns it again in the block that reads it', () => {
+		assert.strictEqual(countLiveness(`private _count = 0;\n${call}\nif (a) then { _count = 1; hint str _count; };`), false);
+		assert.strictEqual(countLiveness(`private "_count";\n${call}\n{ _count = _x; hint str _count; } forEach [1, 2];`), false);
+	});
+
+	test('when that assignment might not run before the read', () => {
+		// Its block has ended: the read may see either value.
+		assert.strictEqual(countLiveness(`private _count = 0;\n${call}\nif (a) then { _count = 1; };\nhint str _count;`), true);
+		// Nothing assigns it first: `isNil` sees the leaked value too.
+		assert.strictEqual(countLiveness(`private "_count";\n${call}\nif (isNil "_count") then { hint "none"; };`), true);
+	});
+
+	test('in a loop, only when the assignment comes before the read in the same round', () => {
+		// The next round assigns it again before reading it.
+		assert.strictEqual(countLiveness(`private _count = 0;\nwhile {a} do {\n\t_count = 1;\n\thint str _count;\n\t${call}\n};`), false);
+		// This round reads it right after the call; the assignment came before the call.
+		assert.strictEqual(countLiveness(`private _count = 0;\nwhile {a} do {\n\t_count = 1;\n\t${call}\n\thint str _count;\n};`), true);
+	});
+
+	test('not when a later call only runs after the caller has assigned it again', () => {
+		const show = { '/m/fn_show.sqf': 'hint str _count;' };
+		assert.strictEqual(countLiveness(`private _count = 0;\n${call}\nif (a) then { _count = 1; call TAG_fnc_show; };`, '_count = 5;', show), false);
+		assert.strictEqual(countLiveness(`private _count = 0;\n${call}\nif (a) then { call TAG_fnc_show; };`, '_count = 5;', show), true);
+	});
+});

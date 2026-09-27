@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { CONFIG_SECTION, readConfig } from './config';
 import { isFunctionConfigFile, isSqfDocument, SqfDiagnostics } from './diagnostics';
 import { MissionRoots } from './missions';
+import { CallSiteMark } from './callSiteMarks';
 import { AddPrivateQuickFix } from './quickFix';
 
 const DEBOUNCE_MS = 300;
@@ -10,7 +11,12 @@ const FUNCTION_CONFIG_GLOB = '**/*.{ext,hpp,EXT,HPP}';
 /** Candidates for `description.ext` and `mission.sqm`, which mark a mission folder; filtered by `MissionRoots.isMarker`. */
 const MISSION_MARKER_GLOB = '**/*.{ext,sqm,EXT,SQM}';
 
-export function activate(context: vscode.ExtensionContext) {
+/** What `activate` returns, for the integration tests to look at what is shown. */
+export interface SqfCheckerApi {
+	callSiteMarks(uri: vscode.Uri): readonly CallSiteMark[];
+}
+
+export function activate(context: vscode.ExtensionContext): SqfCheckerApi {
 	const diagnostics = new SqfDiagnostics();
 	const output = vscode.window.createOutputChannel('SQF Private Variable Checker');
 	context.subscriptions.push(diagnostics, output);
@@ -133,6 +139,8 @@ export function activate(context: vscode.ExtensionContext) {
 	void indexWorkspaceQuietly(diagnostics);
 	// After the configuration listener above, so a reset re-checks everything.
 	void resetMinimumSeverityOnce(context);
+
+	return { callSiteMarks: uri => diagnostics.callSiteMarks(uri) };
 }
 
 /** Bump the suffix to run the reset again in some future release. */

@@ -1,6 +1,43 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.0]
+
+- Scope leaks follow `switch` cases: an assignment in a `case` of a switch on the
+  caller's argument (`switch (_this select 0)`, or a local variable assigned once
+  from it) is no longer a leak through a call that passes a literal for another case,
+  such as `["town-capture", [_town]] call TAG_fnc_displayMessage`.
+- A scope leak is listed in the Problems view only once, at the assignment (with the
+  affected calls under it). The call itself is still underlined in the editor, with
+  the same severity and the details on hover, but is no longer a diagnostic of its
+  own, so it is not listed a second time and no longer counted as a non-private
+  local variable of the calling file by `SQF: Check Workspace` / `SQF: Check File`.
+- Scope leaks that only assign the value the call passes in (`[_id] call f`, and `f`
+  does `_id = _this select 0` and nothing else to `_id`) keep the caller's value, so
+  they are reported with `unusedScopeLeakSeverity` (a warning by default) instead of
+  as errors.
+- Scope leaks that look intentional (the caller does not use its value before the
+  call, and the function never reads back what it assigns, so it is a way of
+  returning a value) are reported as information, with the new code
+  `scope-leak-intentional` and the new setting `intentionalScopeLeakSeverity`.
+- A `// sqf-private: shared _a, _b` comment in a function body confirms that its
+  assignments to those names are meant for the caller, and hides them. A new quick fix
+  on scope leaks inserts it.
+- Scope leak messages are split into lines: a short headline that says how serious
+  it is (`SCOPE LEAK`, `SCOPE LEAK (not read yet)`, `SCOPE LEAK (same value)` or
+  `SCOPE LEAK (looks intentional)`), then the details, the note and the call chain on
+  lines of their own. The hover on an underlined call shows the headline in bold.
+- Every diagnostic's code links to its explanation in the new *Diagnostics* section
+  of the README.
+- Scope leaks know which blocks can never run after the call: another branch of the
+  same `if`/`else` (also `then [{...}, {...}]`), another `case`/`default` of the same
+  `switch`, and the rest of the scope an `exitWith` block leaves (a whole loop, when it
+  is in the loop body). A read there no longer makes a leak an error, and no longer
+  stops one from looking intentional. Inside a loop, the other branch can run on the
+  next round, so there it still counts.
+- A read after the call that the caller's own assignment always comes before (in the
+  read's block, or a block around it, after the call; or earlier in the same round of
+  a loop around the call) no longer counts as reading the leaked value, since it sees
+  the new one. Typical case: `_x = ...; {...} forEach _x;` inside a loop or branch.
 
 - Several missions in one workspace are kept apart: a folder with `description.ext`
   or `mission.sqm` is a mission (failing that, the nearest folder named like one,

@@ -132,7 +132,7 @@
             "hint"
           ],
           "default": "error",
-          "description": "Severity for a confirmed scope leak: a non-private assignment in a called function that overwrites a local variable visible where the function is called. Reported both at the assignment and at the call."
+          "description": "Severity for a confirmed scope leak: a non-private assignment in a called function that overwrites a local variable visible where the function is called. Reported at the assignment; the call is underlined with the same severity, but not listed in the Problems view a second time."
         },
         "sqfPrivateVariableChecker.unusedScopeLeakSeverity": {
           "type": "string",
@@ -143,7 +143,18 @@
             "hint"
           ],
           "default": "warning",
-          "description": "Severity for a confirmed scope leak whose overwritten variable is never read afterwards (not by the caller, not by anything it calls later, and not by the functions in between on the call chain), so it changes nothing yet. Whenever that cannot be ruled out, scopeLeakSeverity is used instead. Change this to 'error' to have an extra safe mode."
+          "description": "Severity for a confirmed scope leak whose overwritten variable is never read afterwards (not by the caller, not by anything it calls later, and not by the functions in between on the call chain), so it changes nothing yet. Also used when the function only assigns the value the call passes in for that variable (`[_x] call f`, and `f` does `_x = _this select 0` and nothing else to `_x`), so the caller's variable keeps its value. Whenever that cannot be ruled out, scopeLeakSeverity is used instead. Change this to 'error' to have an extra safe mode."
+        },
+        "sqfPrivateVariableChecker.intentionalScopeLeakSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "default": "information",
+          "description": "Severity for a confirmed scope leak that looks intentional: the caller does not use its value between setting it and the call, and the function never reads back what it assigns, so the assignment is a way of returning a value. Add `// sqf-private: shared _name` to the function to confirm it and hide the report."
         },
         "sqfPrivateVariableChecker.minimumSeverity": {
           "type": "string",

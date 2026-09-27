@@ -1,0 +1,128 @@
+import * as vscode from 'vscode';
+
+/** Something shown at a mark's hover, with a link to where it is. */
+export interface CallSiteMarkInfo {
+	location: vscode.Location;
+	message: string;
+}
+
+/**
+ * A `call` through which a scope leak happens. Drawn in the editor like a diagnostic,
+ * but not one: the assignment it leads to already has the full diagnostic, with this
+ * call among its related information, so the Problems view lists each leak only once.
+ */
+export interface CallSiteMark {
+	range: vscode.Range;
+	severity: vscode.DiagnosticSeverity;
+	/** A headline, then a line each for the details; plain text. */
+	message: string;
+	related: CallSiteMarkInfo[];
+	/** Shown at the end of the hover, linking to its explanation. */
+	code: { value: string; target: vscode.Uri };
+}
+
+/** Squiggle and overview ruler colors per severity, matching those of diagnostics. */
+const STYLES: [vscode.DiagnosticSeverity, string, string | undefined][] = [
+	[vscode.DiagnosticSeverity.Error, 'editorError', 'editorOverviewRuler.errorForeground'],
+	[vscode.DiagnosticSeverity.Warning, 'editorWarning', 'editorOverviewRuler.warningForeground'],
+	[vscode.DiagnosticSeverity.Information, 'editorInfo', 'editorOverviewRuler.infoForeground'],
+	[vscode.DiagnosticSeverity.Hint, 'editorHint', undefined]
+];
+
+export class CallSiteMarks implements vscode.Disposable {
+	private readonly types = new Map<vscode.DiagnosticSeverity, vscode.TextEditorDecorationType>();
+	private readonly marks = new Map<string, CallSiteMark[]>();
+	private readonly listener: vscode.Disposable;
+
+	constructor() {
+		for (const [severity, color, rulerColor] of STYLES) {
+			this.types.set(
+				severity,
+				vscode.window.createTextEditorDecorationType({
+					// Theme colors are only available here as CSS variables.
+					textDecoration: `underline ${severity === vscode.DiagnosticSeverity.Hint ? 'dotted' : 'wavy'} var(--vscode-${color}-foreground)`,
+					overviewRulerColor: rulerColor && new vscode.ThemeColor(rulerColor),
+					overviewRulerLane: vscode.OverviewRulerLane.Right
+				})
+			);
+		}
+		this.listener = vscode.window.onDidChangeVisibleTextEditors(editors => editors.forEach(editor => this.apply(editor)));
+	}
+
+	dispose(): void {
+		this.listener.dispose();
+		this.types.forEach(type => type.dispose());
+		this.marks.clear();
+	}
+
+	/** The marks currently shown for `uri`. */
+	get(uri: vscode.Uri): readonly CallSiteMark[] {
+		return this.marks.get(uri.toString()) ?? [];
+	}
+
+	set(uri: vscode.Uri, marks: CallSiteMark[]): void {
+		const key = uri.toString();
+		if (marks.length === 0) {
+			if (!this.marks.delete(key)) {
+				return;
+			}
+		} else {
+			this.marks.set(key, marks);
+		}
+		this.applyTo(key);
+	}
+
+	delete(uri: vscode.Uri): void {
+		this.set(uri, []);
+	}
+
+	clear(): void {
+		const keys = [...this.marks.keys()];
+		this.marks.clear();
+		keys.forEach(key => this.applyTo(key));
+	}
+
+	private applyTo(key: string): void {
+		for (const editor of vscode.window.visibleTextEditors) {
+			if (editor.document.uri.toString() === key) {
+				this.apply(editor);
+			}
+		}
+	}
+
+	private apply(editor: vscode.TextEditor): void {
+		const marks = this.marks.get(editor.document.uri.toString()) ?? [];
+		for (const [severity, type] of this.types) {
+			editor.setDecorations(
+				type,
+				marks
+					.filter(mark => mark.severity === severity)
+					.map(mark => ({ range: mark.range, hoverMessage: hover(mark) }))
+			);
+		}
+	}
+}
+
+function hover(mark: CallSiteMark): vscode.MarkdownString {
+	const markdown = new vscode.MarkdownString();
+	const [headline, ...details] = mark.message.split('\n');
+	markdown.appendMarkdown(`**${escapeMarkdown(headline)}**\n\n`);
+	for (const line of details) {
+		markdown.appendText(line);
+		markdown.appendMarkdown('\n\n');
+	}
+	for (const info of mark.related) {
+		const { uri, range } = info.location;
+		const line = range.start.line + 1;
+		const target = uri.with({ fragment: `L${line},${range.start.character + 1}` });
+		const label = `${vscode.workspace.asRelativePath(uri)}:${line}`;
+		markdown.appendMarkdown(`\n\n- [${escapeMarkdown(label)}](${target.toString()}): `);
+		markdown.appendText(info.message);
+	}
+	markdown.appendMarkdown(`\n\n[sqf-private(${escapeMarkdown(mark.code.value)})](${mark.code.target.toString()})`);
+	return markdown;
+}
+
+function escapeMarkdown(text: string): string {
+	return text.replace(/[\\`*_{}[\]()#+\-.!|<>]/g, '\\$&');
+}

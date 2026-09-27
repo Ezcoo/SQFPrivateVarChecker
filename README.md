@@ -39,8 +39,10 @@ _speed = speed _unit;                  // assigned without being declared privat
   non-private assignment in a called function overwrites the caller's variable of the
   same name if one exists. The checker follows every `call` across files, however
   many calls deep, and reports each *confirmed* case (the variable really exists where
-  the call is made) both at the assignment and at the call, whether the overwrite was
-  intentional or not. Callees are resolved from:
+  the call is made) at the assignment, whether the overwrite was intentional or not.
+  The call is underlined in the editor too, with the details on hover, but only the
+  assignment is listed in the Problems view, with the affected calls under it.
+  Callees are resolved from:
   - `CfgFunctions` in `description.ext` or `CfgFunctions.hpp` (including the default
     `functions\Category\fn_name.sqf` paths, category and function `file` attributes,
     and `tag` overrides),
@@ -72,9 +74,20 @@ _speed = speed _unit;                  // assigned without being declared privat
   case when it is certain; when in doubt, it is an error. The value counts as read
   when, before it is overwritten or its scope ends, it is:
   - mentioned after the call, including in a string (`isNil "_x"`, `compile "..."`)
-    and inside blocks that run only sometimes,
+    and inside blocks that run only sometimes, but not in a block that cannot run
+    after it: another branch of the same `if`/`else` (also `then [{...}, {...}]`) or
+    another `case`/`default` of the same `switch`, or, when the call is in an
+    `if (...) exitWith {...}` block, the rest of the scope that block leaves (a loop,
+    for an `exitWith` in a loop body). A `catch` block does count, since it can run
+    after the call. Nor does a read that the caller's own assignment always comes
+    before: one in the same block as the read, or in a block around it, after the
+    call (`_camps = ...; {...} forEach _camps;`), or, in a loop around the call,
+    earlier in the same round. The read then sees that value instead. An assignment
+    in a block that has ended before the read does not count, since it may not have
+    run,
   - mentioned anywhere in an enclosing loop (`while`, `for`, `forEach`, `count`,
-    `waitUntil`, ...), since that code runs again after the call,
+    `waitUntil`, ...), since that code runs again after the call, other branches
+    included,
   - read by a function called later, or by a callee of that function, that has no
     variable of its own by that name, or the call cannot be followed at all
     (`call _param`, `call compile _string`),
@@ -84,6 +97,58 @@ _speed = speed _unit;                  // assigned without being declared privat
     those calls (found in the workspace, any number of calls up) reads it afterwards.
     A file that is only run by `execVM`, `spawn` or an event handler takes its
     variables with it.
+
+  Two kinds of leak straight from the called function (not from further down the
+  chain) are told apart from accidental ones:
+  - **Same value** — the function only assigns what the call passes in for that
+    variable: the caller does `[_itemID, _amount] call TAG_fnc_foo`, and the function
+    does `_itemID = _this select 0` (also `(_this select 0)`, `_this # 0`, or
+    `_this` for `_x call ...`) and never assigns `_itemID` again. The caller's
+    variable keeps its value, so this is reported with `unusedScopeLeakSeverity`,
+    like an unused leak. `round (_this select 1)` and the like do not count.
+  - **Looks intentional** — the caller does not use its value between setting it and
+    the call (not even through a function called in between), and the function never
+    reads back what it assigns (not even through a function it calls afterwards). The
+    assignment is then a way of returning a value, such as a "handled" flag or a
+    cache reset for the caller, and is reported with `intentionalScopeLeakSeverity`
+    (`information` by default) and its own code, `scope-leak-intentional`.
+
+  An assignment inside a `switch` on what the caller passes in only leaks through
+  calls that can select its case. For a function like
+
+  ```sqf
+  private _message = _this select 0;
+  switch (_message) do {
+  	case "build-by": { _var = ...; };
+  	case "town-capture": { ... };
+  };
+  ```
+
+  `["town-capture", [_town]] call TAG_fnc_displayMessage` does not overwrite the
+  caller's `_var`, while `["build-by", ...]` (or a call that passes a variable) does.
+  This works when the switch is on `_this select N` (also `_this # N`, or `_this`),
+  or on a local variable assigned exactly once from it (or by `params`) before the
+  switch; the call passes a string or number literal; and the case labels are
+  literals (`case "a"; case "b": {...}` counts for both). Strings are compared
+  ignoring case. An assignment in `default` only leaks through calls that pass none of
+  the labels.
+
+  To confirm that a function writes into its caller's scope on purpose, add a comment
+  naming the variables anywhere in its body (the file, or the `{...}` of a function
+  defined in code):
+
+  ```sqf
+  TAG_fnc_handleKey = {
+  	// sqf-private: shared _handled
+  	if (_this == 0x12) then { _handled = true; };
+  };
+  ```
+
+  Its assignments to those names are then no longer reported at all, neither as
+  leaks nor as missing `private`. The quick fix *Mark '_name' as shared with the
+  caller on purpose* on a scope leak inserts that comment; on an intentional-looking
+  leak it is the preferred fix, and *Declare private* is not offered, since it would
+  break what the caller relies on.
 - **Several missions in one workspace** — a folder containing `description.ext` or
   `mission.sqm` is a mission, and each `.sqf` file belongs to the nearest one above it.
   A file with no such folder above it belongs to the nearest folder named like a
@@ -114,6 +179,57 @@ Variable names are compared case-insensitively, the way the engine does it. Comm
 string literals and preprocessor lines (`#define`, `#include`) are skipped, so macro
 bodies do not produce false positives.
 
+## Diagnostics
+
+Each diagnostic's code (shown as `sqf-private(code)` in the Problems view and the
+hover) links to its section below.
+
+### missing-private
+
+A local variable is assigned without being declared `private`. If the file or
+function is ever run with `call`, the assignment overwrites a variable of the same
+name in the caller. Fix: declare it `private` (quick fix *Declare '_name' private*).
+
+### duplicate-name
+
+As `missing-private`, and the same name is also used as a local variable in another
+file of the same mission, so the two could meet. Fix: declare it `private`.
+
+### high-risk
+
+The name is missing `private` in two or more files of the same mission, so neither
+side has a scope of its own and they can overwrite each other. Fix: declare it
+`private` in each of them.
+
+### scope-leak
+
+A confirmed leak: a function run with `call` assigns a variable without `private`,
+and some caller up the call chain has a local variable of that name at the call, so
+the function overwrites it. The calls are underlined too, with the details on hover.
+The headline says how serious it is:
+
+- `SCOPE LEAK` — the caller reads the variable afterwards, so this can break
+  something today (`scopeLeakSeverity`, an error by default).
+- `SCOPE LEAK (not read yet)` — nothing reads the overwritten value after the call,
+  so it changes nothing yet (`unusedScopeLeakSeverity`, a warning by default).
+- `SCOPE LEAK (same value)` — the function only assigns the value that the call
+  passes in for it, so the caller's variable keeps its value
+  (`unusedScopeLeakSeverity`).
+
+Fix: declare the variable `private` in the function. If the function writes into its
+caller's scope on purpose, confirm it instead with a `// sqf-private: shared _name`
+comment in the function (quick fix *Mark '_name' as shared with the caller on
+purpose*).
+
+### scope-leak-intentional
+
+A scope leak that looks deliberate: the caller does not use its value between
+setting it and the call, and the function never reads back what it assigns, so the
+assignment is a way of returning a value (`intentionalScopeLeakSeverity`,
+information by default). If it is meant, confirm it with a
+`// sqf-private: shared _name` comment in the function, which hides it; if not,
+declare the variable `private` there.
+
 ## Commands
 
 | Command | Description |
@@ -135,7 +251,8 @@ bodies do not produce false positives.
 | `sqfPrivateVariableChecker.highRiskSeverity` | `warning` | Severity for a non-private variable whose name is missing `private` in two or more different files |
 | `sqfPrivateVariableChecker.detectScopeLeaks` | `true` | Follow `call` chains across files and report assignments that overwrite a caller's local variable |
 | `sqfPrivateVariableChecker.scopeLeakSeverity` | `error` | Severity for such a confirmed scope leak |
-| `sqfPrivateVariableChecker.unusedScopeLeakSeverity` | `warning` | Severity for a confirmed scope leak whose overwritten variable is never read afterwards |
+| `sqfPrivateVariableChecker.unusedScopeLeakSeverity` | `warning` | Severity for a confirmed scope leak whose overwritten variable is never read afterwards, or that only assigns the value the call passes in |
+| `sqfPrivateVariableChecker.intentionalScopeLeakSeverity` | `information` | Severity for a confirmed scope leak that looks like a way of returning a value to the caller |
 | `sqfPrivateVariableChecker.minimumSeverity` | `information` | Hide diagnostics below this severity, e.g. `warning` for warnings + errors, or `error` for errors only |
 | `sqfPrivateVariableChecker.checkOnType` | `true` | Re-check while typing, otherwise only on open and save |
 | `sqfPrivateVariableChecker.treatParamsAsPrivate` | `true` | Accept `params [...]` as a declaration |
@@ -171,5 +288,8 @@ Source layout:
   duplicate-name and high-risk checks; also free of VS Code APIs
 - `src/diagnostics.ts` — runs the analyzer per file, keeps the workspace index up to
   date, and turns the results into diagnostics for open documents and files on disk
-- `src/quickFix.ts` — the `private` insertion code actions
+- `src/callSiteMarks.ts` — underlines the calls through which scope leaks happen,
+  without listing them in the Problems view
+- `src/quickFix.ts` — the code actions that insert `private`, or the
+  `// sqf-private: shared` comment
 - `src/extension.ts` — activation, commands, document listeners

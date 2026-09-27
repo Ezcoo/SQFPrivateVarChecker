@@ -1,5 +1,5 @@
-import { CallSite, CodeBlock, CodeFunction, FlowFacts, LocalWrite, SqfIssue } from './analyzer/analyzer';
-import { FrameReads, frameReads, valueAfterCall } from './analyzer/flow';
+import { CallSite, CaseGuard, CodeBlock, CodeFunction, FlowFacts, LocalWrite, SqfIssue } from './analyzer/analyzer';
+import { FrameReads, frameReads, valueAfterCall, valueAfterWrite, valueBeforeCall } from './analyzer/flow';
 
 /**
  * Finds *confirmed* scope leaks across `call` chains.
@@ -20,6 +20,10 @@ import { FrameReads, frameReads, valueAfterCall } from './analyzer/flow';
  * read afterwards (by the caller, by anything it calls later, or by the functions in
  * between on the call chain). One that is not changes nothing yet, but would as soon as
  * someone reads the variable after the call.
+ *
+ * A leak straight from the called function (not from further down the chain) may also
+ * be recognized as harmless or deliberate (see `LeakKind`). And an assignment in a
+ * `switch` case is not a leak through a call that passes a literal for another case.
  *
  * Deliberately free of the `vscode` API so it can be unit tested without an editor.
  */
@@ -60,9 +64,26 @@ export interface LeakOrigin {
 	 * leaks from. Never `open` in a `LeakingCall`.
 	 */
 	state: OriginState;
+	/** Copied from `LocalWrite.argument`. */
+	argument?: number;
+	/** Copied from `LocalWrite.cases`; only set while `chain` is empty. */
+	cases?: CaseGuard[];
+	/** Set, for a given call, when the leak through it looks harmless or deliberate. */
+	kind?: LeakKind;
 }
 
 export type OriginState = 'live' | 'dead' | 'open';
+
+/**
+ * What a leak straight from the called function looks like:
+ * - `same-value`: the function only assigns the value that this call passes in for it
+ *   (`[_x] call f`, and `f` does `_x = _this select 0` and nothing else to `_x`), so
+ *   the caller's variable keeps its value.
+ * - `intentional`: the caller does not use its value between setting it and the call,
+ *   and the function never reads back what it assigns, so the assignment is only there
+ *   for the caller to read: a way of returning a value.
+ */
+export type LeakKind = 'same-value' | 'intentional';
 
 /** A caller whose local variable is overwritten through `callSite`. */
 export interface AffectedCaller {
@@ -74,6 +95,7 @@ export interface AffectedCaller {
 	chain: string[];
 	/** Whether the overwritten variable may be read after the call (see `LeakOrigin.state`). */
 	live: boolean;
+	kind?: LeakKind;
 }
 
 /** One `call` that lets a callee overwrite local variables visible at the call site. */
@@ -275,7 +297,9 @@ export function findScopeLeaks(
 				start: write.start,
 				end: write.end,
 				chain: [],
-				state: 'open'
+				state: 'open',
+				...(write.argument === undefined ? {} : { argument: write.argument }),
+				...(write.cases === undefined ? {} : { cases: write.cases })
 			});
 		}
 		for (const [callSite, siteIndex] of callsInFrame(facts, block)) {
@@ -284,7 +308,10 @@ export function findScopeLeaks(
 					if (callSite.visibleNames.has(name)) {
 						continue; // Stops here: overwrites this file's own variable.
 					}
-					for (const origin of origins) {
+					for (const { cases, ...origin } of origins) {
+						if (!mayRun(cases, callSite)) {
+							continue;
+						}
 						const state = origin.state === 'open' ? stateAfter(key, siteIndex, name) : origin.state;
 						addOrigin(result, name, { ...origin, chain: [callSite.label, ...origin.chain], state });
 					}
@@ -295,6 +322,30 @@ export function findScopeLeaks(
 		inProgress.delete(frameKey);
 		escapes.set(frameKey, result);
 		return result;
+	};
+
+	// Whether the callee of `callSites[siteIndex]` in file `key` may read `name`.
+	const callReads = (key: string, siteIndex: number, name: string): boolean =>
+		resolveCall(files.get(key)!.callSites[siteIndex], key).some(target => {
+			const callee = readsOf(target);
+			return callee.unknown || callee.names.has(name);
+		});
+
+	// What a leak of `name` from `origin`, straight from frame `frameKey` into the call
+	// `callSites[siteIndex]` of file `callerKey`, looks like (see `LeakKind`).
+	const classify = (callerKey: string, siteIndex: number, frameKey: string, name: string, origin: LeakOrigin): LeakKind | undefined => {
+		const [key, block] = parseFrameKey(frameKey);
+		const callee = files.get(key)!;
+		const own = valueAfterWrite(callee.flow, callee.callSites, block, name, origin.start);
+		const caller = files.get(callerKey)!;
+		if (origin.argument !== undefined && !own.assignedAgain && passes(caller.callSites[siteIndex], origin.argument, name)) {
+			return 'same-value';
+		}
+		if (own.read || own.calls.some(later => callReads(key, later, name))) {
+			return undefined;
+		}
+		const before = valueBeforeCall(caller.flow, caller.callSites, siteIndex, name);
+		return before.unused && !before.calls.some(between => callReads(callerKey, between, name)) ? 'intentional' : undefined;
 	};
 
 	const writes = new Map<string, Map<number, AffectedCaller[]>>();
@@ -309,13 +360,17 @@ export function findScopeLeaks(
 						continue;
 					}
 					for (const found of origins) {
+						if (!mayRun(found.cases, callSite)) {
+							continue;
+						}
 						// The variable is this frame's, but when it is not declared private it
 						// may be its caller's too, and the value lives on there.
 						let state = found.state === 'open' ? stateAfter(callerKey, siteIndex, name) : found.state;
 						if (state === 'open') {
 							state = isLiveOnReturn(frameOfCall(callerKey, siteIndex), name) ? 'live' : 'dead';
 						}
-						const origin: LeakOrigin = { ...found, state };
+						const kind = found.chain.length === 0 ? classify(callerKey, siteIndex, target, name, found) : undefined;
+						const origin: LeakOrigin = { ...found, state, ...(kind ? { kind } : {}) };
 						addOrigin(names, name, origin);
 
 						let byStart = writes.get(origin.fileKey);
@@ -329,7 +384,8 @@ export function findScopeLeaks(
 							callerKey,
 							callSite,
 							chain: [callSite.label, ...origin.chain],
-							live: origin.state === 'live'
+							live: origin.state === 'live',
+							...(kind ? { kind } : {})
 						});
 						byStart.set(origin.start, affected);
 					}
@@ -344,6 +400,25 @@ export function findScopeLeaks(
 	}
 
 	return { writes, calls };
+}
+
+/** Whether an assignment in the `case` blocks `cases` may run when called from `callSite`. */
+function mayRun(cases: CaseGuard[] | undefined, callSite: CallSite): boolean {
+	return (cases ?? []).every(guard => {
+		const { constants } = callSite;
+		const value = guard.argument === -1 ? constants : Array.isArray(constants) ? constants[guard.argument] : undefined;
+		// `_this select 0` of `"a" call f` is not "a"; unknown values may match any case.
+		if (typeof value !== 'string') {
+			return true;
+		}
+		return guard.values.includes(value) !== (guard.isDefault === true);
+	});
+}
+
+/** Whether `callSite` passes its local variable `name` as element `argument` of `_this` (-1: as `_this`). */
+function passes(callSite: CallSite, argument: number, name: string): boolean {
+	const { passed } = callSite;
+	return argument === -1 ? passed === name : Array.isArray(passed) && passed[argument] === name;
 }
 
 function codeBlockKey(fileKey: string, block: number): string {
@@ -384,7 +459,12 @@ function addOrigin(map: Map<string, LeakOrigin[]>, name: string, origin: LeakOri
 		const existing = list[index];
 		const shorter = origin.chain.length < existing.chain.length ? origin : existing;
 		const state = STATE_RANK[origin.state] > STATE_RANK[existing.state] ? origin.state : existing.state;
-		list[index] = { ...shorter, state };
+		const merged: LeakOrigin = { ...shorter, state };
+		// Only as harmless or deliberate as it looks along every chain.
+		if (origin.kind !== existing.kind) {
+			delete merged.kind;
+		}
+		list[index] = merged;
 	}
 	map.set(name, list);
 }

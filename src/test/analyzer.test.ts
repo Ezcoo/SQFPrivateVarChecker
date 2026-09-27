@@ -344,3 +344,128 @@ suite('analyzeFile - flow facts', () => {
 		);
 	});
 });
+
+suite('analyzeFile - alternatives and exits', () => {
+	const blocks = (text: string) =>
+		analyzeFile(text).flow.scopes.slice(1).map(scope => [text.slice(scope.start, scope.end), scope.branch, scope.exits]);
+
+	test('the blocks of one if share a branch, other ifs do not', () => {
+		const text = 'if (a) then { x } else { y };\nif (b) then { z };';
+		assert.deepStrictEqual(blocks(text), [['{ x }', 0, undefined], ['{ y }', 0, undefined], ['{ z }', text.indexOf('if (b)'), undefined]]);
+		assert.deepStrictEqual(blocks('if (a) then [{ x }, { y }];').map(block => block[1]), [0, 0]);
+	});
+
+	test('the cases of one switch share a branch', () => {
+		const text = 'switch (a) do { case 1: { x }; default { y }; };';
+		const body = text.indexOf('{');
+		assert.deepStrictEqual(blocks(text).map(block => block[1]), [undefined, body, body]);
+	});
+
+	test('an exitWith block records where its statement ends', () => {
+		const text = 'if (a) exitWith { x };\nhint "";';
+		assert.deepStrictEqual(blocks(text), [['{ x }', undefined, text.indexOf(';')]]);
+	});
+
+	test('other blocks are neither', () => {
+		assert.deepStrictEqual(blocks('while {a} do { x }; try { y } catch { z };').map(block => [block[1], block[2]]), [
+			[undefined, undefined],
+			[undefined, undefined],
+			[undefined, undefined],
+			[undefined, undefined]
+		]);
+	});
+});
+
+suite('analyzeFile - arguments and shared assignments', () => {
+	const argumentOf = (source: string) => analyze(source)[0].argument;
+
+	test('an assignment of what the caller passed in records where it came from', () => {
+		assert.strictEqual(argumentOf('_a = _this select 1;'), 1);
+		assert.strictEqual(argumentOf('_a = (_this select 0);'), 0);
+		assert.strictEqual(argumentOf('_a = _this # 2;'), 2);
+		assert.strictEqual(argumentOf('_a = _this;'), -1);
+		assert.strictEqual(argumentOf('_a = round (_this select 1);'), undefined);
+		assert.strictEqual(argumentOf('_a = (_this select 0) select 1;'), undefined);
+		assert.strictEqual(argumentOf('_a = _this select _i;'), undefined);
+		assert.strictEqual(argumentOf('_a = 5;'), undefined);
+	});
+
+	test('a code block\'s write records it too', () => {
+		const result = analyzeFile('private _a = 0;\n_f = { _a = _this select 0; };\ncall _f;');
+		assert.strictEqual(result.codeBlocks[0].writes[0].argument, 0);
+	});
+
+	test('a call records the locals it passes', () => {
+		const passed = (source: string) => analyzeFile(source).callSites[0].passed;
+		assert.deepStrictEqual(passed('[_a, 5, _b] call TAG_fnc_f;'), ['_a', undefined, '_b']);
+		assert.deepStrictEqual(passed('_r = [_A, [_b], _c select 0] call TAG_fnc_f;'), ['_a', undefined, undefined]);
+		assert.deepStrictEqual(passed('[] call TAG_fnc_f;'), []);
+		assert.strictEqual(passed('if (x) then { _a call TAG_fnc_f; };'), '_a');
+		assert.deepStrictEqual(passed('hint str round ([_a] call TAG_fnc_f);'), ['_a']);
+		// Here `call` gets the result of `select`, not the array.
+		assert.strictEqual(passed('_x = _list select [_a] call TAG_fnc_f;'), undefined);
+		assert.strictEqual(passed('call TAG_fnc_f;'), undefined);
+	});
+
+	test('a call records the literals it passes', () => {
+		const constants = (source: string) => analyzeFile(source).callSites[0].constants;
+		assert.deepStrictEqual(constants('["Town-Capture", [_town], 2] call TAG_fnc_f;'), ['"town-capture', undefined, '#2']);
+		assert.strictEqual(constants('"a" call TAG_fnc_f;'), '"a');
+		assert.strictEqual(constants('[_a, _b] call TAG_fnc_f;'), undefined);
+		assert.strictEqual(constants('_x = _list select "a" call TAG_fnc_f;'), undefined);
+	});
+
+	test('an assignment in a switch on an argument records its case', () => {
+		const cases = (source: string) => analyzeFile(source).issues.map(issue => [issue.variable, issue.cases] as const);
+		const body = 'switch (_m) do {\n\tcase "a": { _v = 1; };\n\tcase "b"; case "c": { _w = 1; };\n\tdefault { _d = 1; };\n};';
+		const expected = [
+			['_v', [{ argument: 0, values: ['"a'] }]],
+			['_w', [{ argument: 0, values: ['"c', '"b'] }]],
+			['_d', [{ argument: 0, values: ['"a', '"b', '"c'], isDefault: true }]]
+		];
+		assert.deepStrictEqual(cases(`private _m = _this select 0;\n${body}`), expected);
+		assert.deepStrictEqual(cases(`params ["_x", "_m"];\n${body}`).map(([, c]) => c![0].argument), [1, 1, 1]);
+		assert.deepStrictEqual(cases(body.replace('_m', '_this select 2')).map(([, c]) => c![0].argument), [2, 2, 2]);
+	});
+
+	test('a switch not known to be on an argument records no case', () => {
+		const cases = (source: string) => analyzeFile(source).issues.filter(issue => issue.variable === '_v').map(issue => issue.cases);
+		const body = 'switch (_m) do { case "a": { _v = 1; }; };';
+		// Assigned twice, from something else, after the switch, or switched on an expression.
+		assert.deepStrictEqual(cases(`private _m = _this select 0;\nif (x) then { _m = "b"; };\n${body}`), [undefined]);
+		assert.deepStrictEqual(cases(`private _m = toLower (_this select 0);\n${body}`), [undefined]);
+		assert.deepStrictEqual(cases(`${body}\nprivate _m = _this select 0;`), [undefined]);
+		assert.deepStrictEqual(cases('switch (toLower (_this select 0)) do { case "a": { _v = 1; }; };'), [undefined]);
+		// A label that is not a literal, or `_this` of an inline `call`.
+		assert.deepStrictEqual(cases('private _m = _this select 0;\nswitch (_m) do { case A_VAR: { _v = 1; }; };'), [undefined]);
+		assert.deepStrictEqual(cases('private _m = _this select 0;\nswitch (_m) do { case "a": {}; case B: {}; default { _v = 1; }; };'), [undefined]);
+		assert.deepStrictEqual(cases('[1] call { switch (_this select 0) do { case "a": { _v = 1; }; }; };'), [undefined]);
+	});
+
+	test('a code block records a later assignment that runs for other calls', () => {
+		const result = analyzeFile(
+			'TAG_fnc_f = {\n\tswitch (_this select 0) do {\n\t\tcase "a": { _v = 1; };\n\t\tcase "b": { _v = 2; };\n\t};\n\t_v = 3;\n\t_v = 4;\n};'
+		);
+		assert.deepStrictEqual(
+			result.codeBlocks[0].writes.map(write => write.cases?.[0].values),
+			[['"a'], ['"b'], undefined]
+		);
+	});
+
+	test('a shared comment hides the assignments it names in its function body', () => {
+		const result = analyzeFile('// sqf-private: shared _a, _c\n_a = 1;\n_b = 2;\nif (x) then { _c = 3; };');
+		assert.deepStrictEqual(result.issues.map(issue => issue.variable), ['_b']);
+		assert.deepStrictEqual([...result.nonPrivateNames], ['_b']);
+	});
+
+	test('a shared comment only applies to its own function body', () => {
+		const result = analyzeFile(
+			'TAG_fnc_a = {\n\t/* sqf-private: shared _v */\n\t_v = 1;\n};\nTAG_fnc_b = {\n\t_v = 2;\n};\n_v = 3;'
+		);
+		assert.deepStrictEqual(result.issues.map(issue => issue.start), [
+			'TAG_fnc_a = {\n\t/* sqf-private: shared _v */\n\t_v = 1;\n};\nTAG_fnc_b = {\n\t'.length,
+			'TAG_fnc_a = {\n\t/* sqf-private: shared _v */\n\t_v = 1;\n};\nTAG_fnc_b = {\n\t_v = 2;\n};\n'.length
+		]);
+		assert.deepStrictEqual(result.codeBlocks.map(block => block.writes.map(write => write.variable)), [[], ['_v']]);
+	});
+});

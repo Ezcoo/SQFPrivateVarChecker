@@ -1,4 +1,4 @@
-import { Token, tokenize } from './tokenizer';
+import { Comment, Token, tokenize } from './tokenizer';
 
 export interface SqfIssue {
 	/** The variable name exactly as written in the source. */
@@ -22,6 +22,26 @@ export interface SqfIssue {
 	 * with `call`, such an assignment can overwrite a local variable of the caller.
 	 */
 	reachesCaller: boolean;
+	/** Set when the assigned value is what the caller passed in (see `LocalWrite.argument`). */
+	argument?: number;
+	/** Set when the assignment only runs for some of the values the caller passes in (see `CaseGuard`). */
+	cases?: CaseGuard[];
+}
+
+/**
+ * A `case` or `default` block of a `switch` on something the caller passed in (element
+ * `argument` of `_this`, directly or through a local variable assigned from it once):
+ * code in it only runs when the call passes one of the case labels, or, for `default`,
+ * none of them. `switch (_this select 0) do { case "a": {...} }` only runs its block for
+ * `["a"] call f`. An assignment in nested blocks has one guard per `switch`.
+ */
+export interface CaseGuard {
+	/** Element of `_this` switched on; -1 for `_this` itself. */
+	argument: number;
+	/** The case labels (see `constantKey`) that run the block; for `default`, every label of the switch. */
+	values: string[];
+	/** Set for a `default` block: it runs when the argument matches none of `values`. */
+	isDefault?: boolean;
 }
 
 /**
@@ -50,6 +70,16 @@ export interface CallSite {
 	visibleNames: Set<string>;
 	/** True when the call sits inside such a block, so the callee's writes cannot reach this file's own caller. */
 	detached: boolean;
+	/**
+	 * The local variables (lowercased) handed to the callee as `_this`: `_a call f` gives
+	 * `'_a'`, `[_a, 5, _b] call f` gives `['_a', undefined, '_b']`. Unset for anything else.
+	 */
+	passed?: string | (string | undefined)[];
+	/**
+	 * Like `passed`, for the literal strings and numbers handed to the callee, as
+	 * `constantKey` gives them: `["a", _b, 2] call f` gives `['"a', undefined, '#2']`.
+	 */
+	constants?: string | (string | undefined)[];
 	/** The code block (index into `codeBlocks`) that the call is made from, if any. */
 	codeBlock?: number;
 	/** The flow scope (index into `FlowFacts.scopes`) the call is made in. */
@@ -81,6 +111,18 @@ export interface FlowScope {
 	/** The statement containing the block (e.g. the whole `while {...} do {...}`), when it `repeats`. */
 	statementStart: number;
 	statementEnd: number;
+	/**
+	 * Set on a block that is one of several alternatives, of which at most one runs: the
+	 * `then` and `else` blocks of one `if` (also `then [{...}, {...}]`), or the `case` and
+	 * `default` blocks of one `switch`. Blocks with the same `branch` are alternatives to
+	 * each other; the value identifies their statement.
+	 */
+	branch?: number;
+	/**
+	 * Set on the block of `if (...) exitWith {...}`: the offset where that statement ends.
+	 * Once the block has run, the rest of the enclosing scope is skipped.
+	 */
+	exits?: number;
 }
 
 /**
@@ -108,6 +150,14 @@ export interface LocalWrite {
 	variable: string;
 	start: number;
 	end: number;
+	/**
+	 * Set when the assigned value is just what the caller passed in: element `argument`
+	 * of `_this` (`_x = _this select 1`, also `_this # 1`, in parentheses or not), or
+	 * `_this` itself (-1).
+	 */
+	argument?: number;
+	/** Copied to `SqfIssue.cases`. */
+	cases?: CaseGuard[];
 }
 
 /**
@@ -115,7 +165,11 @@ export interface LocalWrite {
  * global function (`TAG_fnc_foo = {...}`), which `call` runs in the caller's scope.
  */
 export interface CodeBlock {
-	/** First assignment of each name that the block does not declare itself, so it reaches the block's caller. */
+	/**
+	 * First assignment of each name that the block does not declare itself, so it reaches
+	 * the block's caller; and the first one in each further set of `case` blocks, when
+	 * the earlier ones only run for some calls.
+	 */
 	writes: LocalWrite[];
 }
 
@@ -232,6 +286,24 @@ interface Scope {
 	detached: boolean;
 	/** Set when the block is a code block stored in a local variable (index into `codeBlocks`). */
 	codeBlock?: number;
+	/** Token index of the `{`; -1 for the file. */
+	brace: number;
+	/** Code in the block has a `_this` of its own: it is detached, or run with `call`. */
+	bindsThis: boolean;
+	/** Set on a `case` or `default` block of a `switch`. */
+	guard?: PendingGuard;
+}
+
+/** A `CaseGuard` whose switch subject may still have to be traced back to `_this`. */
+interface PendingGuard {
+	/** An element of `_this` (see `CaseGuard.argument`), or a local variable (lowercased) that may hold one. */
+	subject: number | string;
+	/** Flow scope whose `_this` the switch sees. */
+	thisScope: number;
+	/** Offset of the `switch`. */
+	offset: number;
+	values: string[];
+	isDefault: boolean;
 }
 
 /** Every assignment to one local variable name in a file. */
@@ -239,6 +311,8 @@ interface LocalAssignments {
 	count: number;
 	/** What the last assignment stored, when it is something `call` can be followed into. */
 	value?: CallTarget;
+	/** When the last assignment stored an element of `_this` (see `LocalWrite.argument`): which one, and where. */
+	argument?: { index: number; thisScope: number; offset: number };
 }
 
 export function analyze(text: string, options: AnalyzerOptions = {}): SqfIssue[] {
@@ -246,7 +320,8 @@ export function analyze(text: string, options: AnalyzerOptions = {}): SqfIssue[]
 }
 
 export function analyzeFile(text: string, options: AnalyzerOptions = {}): AnalyzeResult {
-	const tokens = tokenize(text);
+	const comments: Comment[] = [];
+	const tokens = tokenize(text, comments);
 	const magic = new Set(
 		[...DEFAULT_MAGIC_VARIABLES, ...(options.magicVariables ?? [])].map(name => name.toLowerCase())
 	);
@@ -254,7 +329,9 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 	const forDeclare = options.treatForLoopVariablesAsPrivate !== false;
 
 	// SQF variable names are case insensitive, so every lookup is lowercased.
-	const scopes: Scope[] = [{ id: 0, names: new Set<string>(), nonPrivate: new Set<string>(), detached: false }];
+	const scopes: Scope[] = [
+		{ id: 0, names: new Set<string>(), nonPrivate: new Set<string>(), detached: false, brace: -1, bindsThis: true }
+	];
 	const flowScopes: FlowScope[] = [
 		{ parent: -1, start: 0, end: text.length, detached: false, repeats: false, statementStart: 0, statementEnd: text.length }
 	];
@@ -272,6 +349,8 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 	// For each open `[`, whether it is the `then [{...}, {...}]` form, whose blocks
 	// run in place like ordinary `then {...} else {...}` blocks.
 	const arrays: boolean[] = [];
+	// Token index of each open `[`.
+	const arrayStarts: number[] = [];
 	const codeBlocks: CodeBlock[] = [];
 	// Token index of a `{` -> the code block it opens.
 	const codeBlockStarts = new Map<number, number>();
@@ -326,11 +405,33 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 		}
 		return false;
 	};
-	const recordAssignment = (name: string, valueIndex: number) => {
+	const thisScope = () => {
+		for (let s = scopes.length - 1; s > 0; s--) {
+			if (scopes[s].bindsThis) {
+				return scopes[s].id;
+			}
+		}
+		return 0;
+	};
+	// The `case` blocks an assignment here sits in, within its own function body.
+	const guardsHere = () => {
+		const frame = Math.max(nearestDetached(), 0);
+		const frameThis = scopes[frame].id;
+		return scopes
+			.slice(frame)
+			.flatMap(scope => (scope.guard && scope.guard.thisScope === frameThis ? [scope.guard] : []));
+	};
+	// Assignments whose `cases` are still pending, resolved once every assignment is known.
+	const pendingGuards = new Map<SqfIssue | LocalWrite, PendingGuard[]>();
+	const recordAssignment = (name: string, valueIndex: number, argument?: number) => {
 		const lower = name.toLowerCase();
 		const entry = localAssignments.get(lower) ?? { count: 0 };
 		entry.count++;
 		entry.value = undefined;
+		entry.argument = undefined;
+		if (argument !== undefined) {
+			entry.argument = { index: argument, thisScope: thisScope(), offset: offsetAt(valueIndex) };
+		}
 		const value = tokens[valueIndex];
 		if (value?.type === 'symbol' && value.value === '{') {
 			codeBlocks.push({ writes: [] });
@@ -369,6 +470,8 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 				const detached = opensDetachedBlock(tokens[i - 1], arrays);
 				const codeBlock = codeBlockStarts.get(i);
 				const repeats = !detached && mayRepeat(tokens, i, arrays);
+				const alternative = detached ? {} : readAlternative(tokens, i, arrays, arrayStarts, flowScopes[currentScope()]);
+				const guard = detached ? undefined : readCaseGuard(tokens, i, scopes[scopes.length - 1].brace, thisScope());
 				flowScopes.push({
 					parent: currentScope(),
 					start: token.start,
@@ -377,14 +480,18 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 					codeBlock,
 					repeats,
 					statementStart: repeats ? offsetAt(statementStart(tokens, i)) : token.start,
-					statementEnd: repeats ? offsetAt(statementEnd(tokens, i)) : token.start
+					statementEnd: repeats ? offsetAt(statementEnd(tokens, i)) : token.start,
+					...alternative
 				});
 				scopes.push({
 					id: flowScopes.length - 1,
 					names: new Set<string>(),
 					nonPrivate: new Set<string>(),
 					detached,
-					codeBlock
+					codeBlock,
+					brace: i,
+					bindsThis: detached || (tokens[i - 1]?.type === 'ident' && tokens[i - 1].value.toLowerCase() === 'call'),
+					...optional('guard', guard)
 				});
 				if (pendingForVariable !== undefined) {
 					if (tokens[i - 1]?.type === 'ident' && tokens[i - 1].value.toLowerCase() === 'do') {
@@ -398,8 +505,10 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 			} else if (token.value === '[') {
 				const previous = tokens[i - 1];
 				arrays.push(previous !== undefined && previous.type === 'ident' && previous.value.toLowerCase() === 'then');
+				arrayStarts.push(i);
 			} else if (token.value === ']') {
 				arrays.pop();
+				arrayStarts.pop();
 			}
 			continue;
 		}
@@ -430,7 +539,7 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 			const declared = tokens[i + 1];
 			i = consumePrivate(tokens, i, declareHere);
 			if (declared?.type === 'ident' && tokens[i] === declared && tokens[i + 1]?.value === '=') {
-				recordAssignment(declared.value, i + 2);
+				recordAssignment(declared.value, i + 2, readThisArgument(tokens, i + 2, statementEnd(tokens, i)));
 			}
 			continue;
 		}
@@ -438,7 +547,13 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 		if (paramsDeclare && lower === 'params') {
 			const next = tokens[i + 1];
 			if (next && next.type === 'symbol' && next.value === '[') {
-				i = declareStringsInArray(tokens, i + 1, declareHere);
+				// `params [...]` reads `_this`; `_array params [...]` reads `_array`.
+				const previous = tokens[i - 1];
+				const ofThis = previous === undefined || (previous.type === 'symbol' && ARGUMENT_BOUNDARIES.has(previous.value));
+				i = declareStringsInArray(tokens, i + 1, (name, position) => {
+					declareHere(name);
+					recordAssignment(name, i, ofThis ? position : undefined);
+				});
 			}
 			continue;
 		}
@@ -461,7 +576,8 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 				detached: isDetached(),
 				codeBlock: currentCodeBlock(),
 				scope: currentScope(),
-				owners
+				owners,
+				...readPassed(tokens, i)
 			};
 			const callee = tokens[i + 1];
 			// Inline code is part of this file, so its reads and writes are seen directly;
@@ -512,29 +628,40 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 		const next = tokens[i + 1];
 		const isAssignment = next !== undefined && next.type === 'symbol' && next.value === '=';
 		addEvent(isAssignment ? 'assign' : 'read', token.value, isAssignment ? offsetAt(statementEnd(tokens, i)) : token.start);
+		const argument = isAssignment ? readThisArgument(tokens, i + 2, statementEnd(tokens, i)) : undefined;
+		const guards = isAssignment ? guardsHere() : [];
 		if (isAssignment) {
-			recordAssignment(token.value, i + 2);
+			recordAssignment(token.value, i + 2, argument);
 
 			// Inside a code block, anything the block does not declare itself reaches
-			// whoever calls it, even if the file declares that name further out.
+			// whoever calls it, even if the file declares that name further out. A later
+			// assignment counts too when it runs for calls that the earlier ones do not.
 			const frame = nearestDetached();
 			const block = frame === -1 ? undefined : scopes[frame].codeBlock;
 			if (block !== undefined && !scopes.slice(frame).some(scope => scope.names.has(lower))) {
 				const writes = codeBlocks[block].writes;
-				if (!writes.some(write => write.variable.toLowerCase() === lower)) {
-					writes.push({ variable: token.value, start: token.start, end: token.end });
+				const covered = writes.some(
+					write =>
+						write.variable.toLowerCase() === lower &&
+						(pendingGuards.get(write) ?? []).every(guard => guards.includes(guard))
+				);
+				if (!covered) {
+					const write: LocalWrite = { variable: token.value, start: token.start, end: token.end, ...optional('argument', argument) };
+					writes.push(write);
+					pendingGuards.set(write, guards);
 				}
 			}
 		}
 		if (isAssignment && !isDeclared(token.value)) {
-			issues.push({
+			pendingGuards.set(issues[issues.push({
 				variable: token.value,
 				start: token.start,
 				end: token.end,
 				message: `Local variable '${token.value}' is assigned without being declared private.`,
 				kind: 'missing-private',
-				reachesCaller: !isDetached()
-			});
+				reachesCaller: !isDetached(),
+				...optional('argument', argument)
+			}) - 1], guards);
 			// Record it so the same variable is reported once per scope rather
 			// than on every following assignment.
 			markDeclared(token.value);
@@ -542,16 +669,48 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 		}
 	}
 
-	const privateNames = new Set<string>();
-	const nonPrivateNames = new Set<string>();
-	for (const occurrence of occurrences) {
-		const lower = occurrence.name.toLowerCase();
-		if (occurrence.isPrivate) {
-			privateNames.add(lower);
-		} else {
-			nonPrivateNames.add(lower);
+	// A switch on a local variable is on the caller's argument when the variable is
+	// assigned exactly once in the file, from `_this`, before the switch.
+	const argumentOf = (guard: PendingGuard) => {
+		if (typeof guard.subject === 'number') {
+			return guard.subject;
+		}
+		const assignments = localAssignments.get(guard.subject);
+		const argument = assignments?.count === 1 ? assignments.argument : undefined;
+		return argument && argument.thisScope === guard.thisScope && argument.offset < guard.offset ? argument.index : undefined;
+	};
+	for (const [write, guards] of pendingGuards) {
+		const cases = guards.flatMap(guard => {
+			const argument = argumentOf(guard);
+			return argument === undefined
+				? []
+				: [{ argument, values: guard.values, ...(guard.isDefault ? { isDefault: true } : {}) }];
+		});
+		if (cases.length > 0) {
+			write.cases = cases;
 		}
 	}
+
+	// `// sqf-private: shared _a, _b` in a function body: its assignments to those names
+	// are meant for its caller, so they are neither issues nor scope leaks.
+	const shared = sharedDirectives(comments, flowScopes);
+	const isShared = (write: { variable: string; start: number }) => {
+		const frame = frameAt(flowScopes, write.start);
+		return shared.some(directive => directive.frame === frame && directive.names.has(write.variable.toLowerCase()));
+	};
+	const reported = issues.filter(issue => !isShared(issue));
+	for (const block of codeBlocks) {
+		block.writes = block.writes.filter(write => !isShared(write));
+	}
+
+	const privateNames = new Set<string>();
+	for (const occurrence of occurrences) {
+		if (occurrence.isPrivate) {
+			privateNames.add(occurrence.name.toLowerCase());
+		}
+	}
+	// Every non-private occurrence is an issue.
+	const nonPrivateNames = new Set(reported.map(issue => issue.variable.toLowerCase()));
 
 	// `call _fnc` is only followed when `_fnc` is assigned exactly once in the file, so
 	// there is no doubt about what it holds.
@@ -565,7 +724,7 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 	events.sort((a, b) => a.offset - b.offset);
 
 	return {
-		issues,
+		issues: reported,
 		privateNames,
 		nonPrivateNames,
 		callSites,
@@ -574,6 +733,269 @@ export function analyzeFile(text: string, options: AnalyzerOptions = {}): Analyz
 		codeBlocks,
 		flow: { scopes: flowScopes, events }
 	};
+}
+
+/** `{ [key]: value }`, or nothing when `value` is undefined, so objects compare equal without the key. */
+function optional<K extends string, V>(key: K, value: V | undefined): { [P in K]?: V } {
+	return (value === undefined ? {} : { [key]: value }) as { [P in K]?: V };
+}
+
+const SHARED_DIRECTIVE = /\bsqf-private:\s*shared\b(.*)/i;
+
+/** The `sqf-private: shared` comments, each with its frame (see `frameAt`) and the names (lowercased) it lists. */
+function sharedDirectives(comments: Comment[], scopes: FlowScope[]): { frame: number; names: Set<string> }[] {
+	const directives: { frame: number; names: Set<string> }[] = [];
+	for (const comment of comments) {
+		const match = SHARED_DIRECTIVE.exec(comment.text);
+		if (match) {
+			const names = new Set([...match[1].matchAll(/_[A-Za-z0-9_]+/g)].map(([name]) => name.toLowerCase()));
+			directives.push({ frame: frameAt(scopes, comment.start), names });
+		}
+	}
+	return directives;
+}
+
+/**
+ * The function body that `offset` is in: the nearest enclosing block that does not run
+ * in its surrounding scope (a code block stored in a variable, a `spawn` block, ...), or
+ * the file (0).
+ */
+function frameAt(scopes: FlowScope[], offset: number): number {
+	let innermost = 0;
+	scopes.forEach((scope, index) => {
+		// Blocks are recorded in source order, so a later one containing `offset` is nested deeper.
+		if (index > 0 && scope.start <= offset && offset < scope.end) {
+			innermost = index;
+		}
+	});
+	let frame = innermost;
+	while (frame > 0 && !scopes[frame].detached) {
+		frame = scopes[frame].parent;
+	}
+	return frame;
+}
+
+/** Tokens after which an expression starts, so `[...] call f` there is given exactly that array. */
+const ARGUMENT_BOUNDARIES = new Set(['=', '(', '[', ',', ';', '{']);
+
+/** What `CallSite.passed` and `CallSite.constants` say for the `call` at `index`. */
+function readPassed(tokens: Token[], index: number): Pick<CallSite, 'passed' | 'constants'> {
+	const single = (from: number, to: number) => (to - from === 1 ? tokens[from] : undefined);
+	const localName = (token: Token | undefined) =>
+		token?.type === 'ident' && isLocalVariableName(token.value) ? token.value.toLowerCase() : undefined;
+	const last = index - 1;
+	let first: number;
+	let items: (Token | undefined)[];
+	let isArray = false;
+	if (localName(tokens[last]) !== undefined || constantKey(tokens[last]) !== undefined) {
+		first = last;
+		items = [tokens[last]];
+	} else if (tokens[last]?.type === 'symbol' && tokens[last].value === ']') {
+		let depth = 0;
+		for (first = last; first >= 0; first--) {
+			const value = tokens[first].type === 'symbol' ? tokens[first].value : '';
+			if (value === ']') {
+				depth++;
+			} else if (value === '[' && --depth === 0) {
+				break;
+			}
+		}
+		if (first < 0) {
+			return {};
+		}
+		items = [];
+		let itemStart = first + 1;
+		depth = 0;
+		for (let j = first + 1; j < last; j++) {
+			const value = tokens[j].type === 'symbol' ? tokens[j].value : '';
+			if (value === '(' || value === '[' || value === '{') {
+				depth++;
+			} else if (value === ')' || value === ']' || value === '}') {
+				depth--;
+			} else if (value === ',' && depth === 0) {
+				items.push(single(itemStart, j));
+				itemStart = j + 1;
+			}
+		}
+		if (itemStart < last) {
+			items.push(single(itemStart, last));
+		}
+		isArray = true;
+	} else {
+		return {};
+	}
+	const before = tokens[first - 1];
+	if (!(before === undefined || (before.type === 'symbol' && ARGUMENT_BOUNDARIES.has(before.value)))) {
+		return {};
+	}
+	if (!isArray) {
+		return { ...optional('passed', localName(items[0])), ...optional('constants', constantKey(items[0])) };
+	}
+	const constants = items.map(constantKey);
+	return {
+		passed: items.map(localName),
+		...(constants.some(key => key !== undefined) ? { constants } : {})
+	};
+}
+
+/**
+ * A literal string or number as a switch compares it: `"a"` -> `'"a'` (lowercased, as
+ * string comparison in SQF ignores case), `2` -> `'#2'`. Undefined for anything else.
+ */
+export function constantKey(token: Token | undefined): string | undefined {
+	if (token?.type === 'string') {
+		return `"${token.value.toLowerCase()}`;
+	}
+	if (token?.type === 'number') {
+		const value = Number(token.value.replace(/^\$/, '0x'));
+		return Number.isNaN(value) ? undefined : `#${value}`;
+	}
+	return undefined;
+}
+
+/**
+ * The `PendingGuard` of the block opened by the `{` at `index`, when it is a `case` or
+ * `default` block of a switch on `_this` or a local variable, and every case label of
+ * that switch that matters is a literal. `parentBrace` is the `{` of the enclosing block.
+ */
+function readCaseGuard(tokens: Token[], index: number, parentBrace: number, thisScope: number): PendingGuard | undefined {
+	const isSymbol = (i: number, value: string) => tokens[i]?.type === 'symbol' && tokens[i].value === value;
+	const isIdent = (i: number, value: string) => tokens[i]?.type === 'ident' && tokens[i].value.toLowerCase() === value;
+	const isDefault = isIdent(index - 1, 'default');
+	if (!(isDefault || isSymbol(index - 1, ':')) || parentBrace < 0 || !isIdent(parentBrace - 1, 'do')) {
+		return undefined;
+	}
+	const switchIndex = statementStart(tokens, parentBrace - 1);
+	if (!isIdent(switchIndex, 'switch')) {
+		return undefined;
+	}
+
+	let from = switchIndex + 1;
+	let to = parentBrace - 1;
+	while (isSymbol(from, '(') && isSymbol(to - 1, ')') && closingParenthesis(tokens, from) === to - 1) {
+		from++;
+		to--;
+	}
+	const argument = readThisArgument(tokens, from, to);
+	const subject =
+		argument ?? (to - from === 1 && tokens[from].type === 'ident' && isLocalVariableName(tokens[from].value)
+			? tokens[from].value.toLowerCase()
+			: undefined);
+	if (subject === undefined) {
+		return undefined;
+	}
+
+	const values: string[] = [];
+	if (isDefault) {
+		// Every label in the switch body, which `default` runs for none of.
+		let depth = 0;
+		for (let i = parentBrace + 1; i < tokens.length; i++) {
+			if (tokens[i].type === 'symbol') {
+				if (tokens[i].value === '(' || tokens[i].value === '[' || tokens[i].value === '{') {
+					depth++;
+				} else if (tokens[i].value === ')' || tokens[i].value === ']' || tokens[i].value === '}') {
+					if (depth-- === 0) {
+						break;
+					}
+				}
+			} else if (depth === 0 && isIdent(i, 'case')) {
+				const key = constantKey(tokens[i + 1]);
+				if (key === undefined || !(isSymbol(i + 2, ':') || isSymbol(i + 2, ';'))) {
+					return undefined;
+				}
+				values.push(key);
+			}
+		}
+	} else {
+		// `case "a"; case "b": {...}` runs the block for both.
+		for (let colon = index - 1; ; colon -= 3) {
+			const key = constantKey(tokens[colon - 1]);
+			if (key === undefined || !isIdent(colon - 2, 'case')) {
+				return undefined;
+			}
+			values.push(key);
+			if (!isSymbol(colon - 3, ';') || !isIdent(colon - 5, 'case')) {
+				break;
+			}
+		}
+	}
+	return { subject, thisScope, offset: tokens[switchIndex].start, values, isDefault };
+}
+
+/** What `LocalWrite.argument` says for the value in tokens [from, to). */
+function readThisArgument(tokens: Token[], from: number, to: number): number | undefined {
+	const isSymbol = (i: number, value: string) => tokens[i]?.type === 'symbol' && tokens[i].value === value;
+	while (isSymbol(from, '(') && isSymbol(to - 1, ')') && closingParenthesis(tokens, from) === to - 1) {
+		from++;
+		to--;
+	}
+	const first = tokens[from];
+	if (first?.type !== 'ident' || first.value.toLowerCase() !== '_this') {
+		return undefined;
+	}
+	if (to - from === 1) {
+		return -1;
+	}
+	const operator = tokens[from + 1];
+	const index = tokens[from + 2];
+	const selects = operator.value.toLowerCase() === 'select' || isSymbol(from + 1, '#');
+	return to - from === 3 && selects && index.type === 'number' && /^\d+$/.test(index.value) ? Number(index.value) : undefined;
+}
+
+/** Index of the `)` matching the `(` at `index`. */
+function closingParenthesis(tokens: Token[], index: number): number {
+	let depth = 0;
+	for (let i = index; i < tokens.length; i++) {
+		if (tokens[i].type !== 'symbol') {
+			continue;
+		}
+		if (tokens[i].value === '(') {
+			depth++;
+		} else if (tokens[i].value === ')' && --depth === 0) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+/**
+ * `FlowScope.branch` and `FlowScope.exits` for the (not detached) block opened by the
+ * `{` at `index`, inside `parent`.
+ */
+function readAlternative(
+	tokens: Token[],
+	index: number,
+	arrays: boolean[],
+	arrayStarts: number[],
+	parent: FlowScope
+): Pick<FlowScope, 'branch' | 'exits'> {
+	const previous = tokens[index - 1];
+	const offsetOf = (i: number) => (i < tokens.length ? tokens[i].start : tokens[tokens.length - 1].end);
+	if (previous?.type === 'ident') {
+		const command = previous.value.toLowerCase();
+		// Both blocks of one `if` share the start of its statement.
+		if (command === 'then' || command === 'else') {
+			return { branch: offsetOf(statementStart(tokens, index - 1)) };
+		}
+		// Everything directly in a `switch` body is its cases.
+		if (command === 'default') {
+			return { branch: parent.start };
+		}
+		if (command === 'exitwith') {
+			return { exits: offsetOf(statementEnd(tokens, index)) };
+		}
+		return {};
+	}
+	if (previous?.type === 'symbol') {
+		if (previous.value === ':') {
+			return { branch: parent.start };
+		}
+		// `if (...) then [{...}, {...}]`.
+		if ((previous.value === '[' || previous.value === ',') && arrays[arrays.length - 1]) {
+			return { branch: offsetOf(statementStart(tokens, arrayStarts[arrayStarts.length - 1] - 1)) };
+		}
+	}
+	return {};
 }
 
 /**
@@ -862,13 +1284,21 @@ function consumePrivate(tokens: Token[], index: number, declare: (name: string) 
  * `openIndex`, including nested defaults such as `params [["_x", 0]]`.
  * Returns the index of the matching `]`, or the last token seen.
  */
-function declareStringsInArray(tokens: Token[], openIndex: number, declare: (name: string) => void): number {
+function declareStringsInArray(
+	tokens: Token[],
+	openIndex: number,
+	declare: (name: string, position: number | undefined) => void
+): number {
 	let depth = 0;
+	// Index of the current element of the outer array.
+	let element = 0;
 	for (let i = openIndex; i < tokens.length; i++) {
 		const token = tokens[i];
 		if (token.type === 'symbol') {
 			if (token.value === '[') {
 				depth++;
+			} else if (token.value === ',' && depth === 1) {
+				element++;
 			} else if (token.value === ']') {
 				depth--;
 				if (depth === 0) {
@@ -881,7 +1311,10 @@ function declareStringsInArray(tokens: Token[], openIndex: number, declare: (nam
 			continue;
 		}
 		if (token.type === 'string' && isLocalVariableName(token.value)) {
-			declare(token.value);
+			// The name of element `element`: `"_a"` or `["_a", default]`, not a default value.
+			const previous = tokens[i - 1].value;
+			const named = depth === 1 || (depth === 2 && previous === '[' && (tokens[i - 2].value === '[' || tokens[i - 2].value === ','));
+			declare(token.value, named ? element : undefined);
 		}
 	}
 	return tokens.length - 1;

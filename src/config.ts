@@ -29,13 +29,18 @@ export interface CheckerConfig extends AnalyzerOptions {
 	 * overwrite a local variable of some caller up the chain.
 	 */
 	detectScopeLeaks: boolean;
-	/** Severity for such a confirmed scope leak, at both the assignment and the call. */
+	/** Severity for such a confirmed scope leak, at the assignment and the call's mark. */
 	scopeLeakSeverity: vscode.DiagnosticSeverity;
 	/**
 	 * Severity for a confirmed scope leak whose overwritten variable is never read
 	 * afterwards, so it changes nothing yet.
 	 */
 	unusedScopeLeakSeverity: vscode.DiagnosticSeverity;
+	/**
+	 * Severity for a confirmed scope leak that looks deliberate: the caller does not use
+	 * its value before the call, and the function never reads back what it assigns.
+	 */
+	intentionalScopeLeakSeverity: vscode.DiagnosticSeverity;
 	/** Diagnostics less severe than this (e.g. Hint when this is Warning) are hidden. */
 	minimumSeverity: vscode.DiagnosticSeverity;
 	checkOnType: boolean;
@@ -57,6 +62,7 @@ export function readConfig(scope?: vscode.ConfigurationScope): CheckerConfig {
 		detectScopeLeaks: config.get<boolean>('detectScopeLeaks', true),
 		scopeLeakSeverity: toSeverity(config.get<string>('scopeLeakSeverity', 'error')),
 		unusedScopeLeakSeverity: toSeverity(config.get<string>('unusedScopeLeakSeverity', 'warning')),
+		intentionalScopeLeakSeverity: toSeverity(config.get<string>('intentionalScopeLeakSeverity', 'information')),
 		minimumSeverity: toSeverity(config.get<string>('minimumSeverity', 'information')),
 		checkOnType: config.get<boolean>('checkOnType', true),
 		magicVariables: config.get<string[]>('magicVariables', []),

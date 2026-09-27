@@ -21,7 +21,15 @@ export interface Token {
 /** Operators that must not be split, so that `==` is never read as `=`. */
 const MULTI_CHAR_OPERATORS = ['==', '!=', '<=', '>=', '&&', '||', '>>'];
 
-export function tokenize(text: string): Token[] {
+/** A `// ...` or `/* ... *\/` comment, which is not a token. */
+export interface Comment {
+	/** The comment's text, without its `//` or `/* *\/`. */
+	text: string;
+	start: number;
+}
+
+/** Splits `text` into tokens; comments are skipped, and collected into `comments` when given. */
+export function tokenize(text: string, comments?: Comment[]): Token[] {
 	const tokens: Token[] = [];
 	const len = text.length;
 	let i = 0;
@@ -35,17 +43,21 @@ export function tokenize(text: string): Token[] {
 		}
 
 		if (ch === '/' && text[i + 1] === '/') {
+			const start = i;
 			while (i < len && text[i] !== '\n') {
 				i++;
 			}
+			comments?.push({ text: text.slice(start + 2, i), start });
 			continue;
 		}
 
 		if (ch === '/' && text[i + 1] === '*') {
+			const start = i;
 			i += 2;
 			while (i < len && !(text[i] === '*' && text[i + 1] === '/')) {
 				i++;
 			}
+			comments?.push({ text: text.slice(start + 2, i), start });
 			i = Math.min(i + 2, len);
 			continue;
 		}
