@@ -2,8 +2,8 @@
   "name": "sqf-private-variable-checker",
   "displayName": "SQF Private Variable Checker",
   "publisher": "Ezcoo",
-  "description": "Checks all local variables and informs the user if there are non-private local vars of confirmed scope leak.",
-  "version": "0.3.0",
+  "description": "Checks all local variables and informs the user if there are issues with variable scopes, from minor issues to very high risk variables.",
+  "version": "0.3.1",
   "icon": "resources/icon.png",
   "repository": {
     "type": "git",

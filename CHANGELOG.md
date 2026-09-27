@@ -1,12 +1,14 @@
 # Changelog
 
-## [Unreleased]
+## [0.3.1]
 
 - Scope leaks whose overwritten variable is never read afterwards (by the caller, by
   anything it calls later, or by the functions in between on the call chain) are now
   reported with the new `unusedScopeLeakSeverity` setting, `warning` by default,
   instead of as errors. When that cannot be ruled out (for example the variable is
   read in an enclosing loop, or a later call cannot be followed), it stays an error.
+
+## [0.3.0]
 
 - Scope leak detection: follows `call` chains across files, any number of calls
   deep, and reports a non-private assignment in a called function that overwrites a
