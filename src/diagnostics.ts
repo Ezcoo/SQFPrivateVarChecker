@@ -58,6 +58,15 @@ const intentionalNote = (variable: string) =>
 
 /** How long to wait after the last file change before re-following call chains. */
 const SCOPE_LEAK_DEBOUNCE_MS = 250;
+/**
+ * How often buffered diagnostics are handed to VS Code. A workspace scan re-emits files
+ * many times over (every name a file adds re-emits the files sharing it, and so does
+ * every pass over the call chains); sending each of those on its own floods the Problems
+ * view, which then stops redrawing until it is toggled, though its counters keep up.
+ */
+const PUBLISH_INTERVAL_MS = 150;
+/** The most diagnostics handed to VS Code in one `set` call; see `batches`. */
+const MAX_DIAGNOSTICS_PER_SET = 1000;
 
 function decode(bytes: Uint8Array): string {
 	return new TextDecoder().decode(bytes);
@@ -106,6 +115,16 @@ export class SqfDiagnostics implements vscode.Disposable {
 	private readonly configIncludes = new Map<string, Set<string>>();
 	private leaks: ScopeLeakResult = NO_LEAKS;
 	private leakTimer: NodeJS.Timeout | undefined;
+	/** Diagnostics not yet handed to VS Code, by file key; an empty list removes the file's. */
+	private readonly pending = new Map<string, { uri: vscode.Uri; diagnostics: vscode.Diagnostic[] }>();
+	/**
+	 * What was last handed to VS Code for each file, by file key: to skip sending it again
+	 * unchanged, and to tell when its most severe diagnostic changes.
+	 */
+	private readonly published = new Map<string, { signature: string; top: vscode.DiagnosticSeverity }>();
+	private publishTimer: NodeJS.Timeout | undefined;
+	/** How many `hold`s are in effect; nothing is published while there are any. */
+	private holds = 0;
 
 	constructor() {
 		this.collection = vscode.languages.createDiagnosticCollection('sqf-private-variables');
@@ -113,12 +132,17 @@ export class SqfDiagnostics implements vscode.Disposable {
 
 	dispose(): void {
 		clearTimeout(this.leakTimer);
+		clearTimeout(this.publishTimer);
 		this.collection.dispose();
 		this.callMarks.dispose();
 	}
 
 	clear(): void {
 		clearTimeout(this.leakTimer);
+		clearTimeout(this.publishTimer);
+		this.publishTimer = undefined;
+		this.pending.clear();
+		this.published.clear();
 		this.collection.clear();
 		this.callMarks.clear();
 		this.files.clear();
@@ -131,7 +155,83 @@ export class SqfDiagnostics implements vscode.Disposable {
 
 	/** How many of this extension's diagnostics are currently shown for `uri`. */
 	shownCount(uri: vscode.Uri): number {
-		return this.collection.get(uri)?.length ?? 0;
+		return this.pending.get(uri.toString())?.diagnostics.length ?? this.collection.get(uri)?.length ?? 0;
+	}
+
+	/**
+	 * Keeps diagnostics back until the matching `release`, for a workspace scan: files
+	 * change severity many times while the rest of the workspace is read in, and the
+	 * Problems view only sorts files by severity as they are added to it, so they are
+	 * all added at once with their final severities.
+	 */
+	hold(): void {
+		this.holds++;
+		clearTimeout(this.publishTimer);
+		this.publishTimer = undefined;
+	}
+
+	release(): void {
+		this.holds = Math.max(0, this.holds - 1);
+		if (this.holds === 0) {
+			this.publish();
+		}
+	}
+
+	/** Buffers `diagnostics` as the ones to show for `uri`, sent on the next `publish`. */
+	private show(uri: vscode.Uri, diagnostics: vscode.Diagnostic[]): void {
+		this.pending.set(uri.toString(), { uri, diagnostics });
+		this.schedulePublish();
+	}
+
+	private schedulePublish(): void {
+		if (this.holds === 0) {
+			this.publishTimer ??= setTimeout(() => this.publish(), PUBLISH_INTERVAL_MS);
+		}
+	}
+
+	/**
+	 * Hands every buffered change to VS Code at once, leaving out files whose diagnostics
+	 * did not change. A file whose most severe diagnostic changed is removed first and
+	 * added back on the next publish: the Problems view sorts files by their most severe
+	 * diagnostic, but only as they are added, not when the ones it already lists change.
+	 */
+	private publish(): void {
+		clearTimeout(this.publishTimer);
+		this.publishTimer = undefined;
+
+		const changed: [vscode.Uri, vscode.Diagnostic[]][] = [];
+		const readd = new Map<string, { uri: vscode.Uri; diagnostics: vscode.Diagnostic[] }>();
+		for (const [key, entry] of this.pending) {
+			const { uri, diagnostics } = entry;
+			const signature = diagnostics.map(diagnosticSignature).join('\n');
+			const before = this.published.get(key);
+			if (before?.signature === signature || (!before && diagnostics.length === 0)) {
+				continue;
+			}
+			if (diagnostics.length === 0) {
+				this.published.delete(key);
+				this.collection.delete(uri);
+				continue;
+			}
+			// Error=0 ... Hint=3, so the most severe is the smallest.
+			const top = Math.min(...diagnostics.map(d => d.severity)) as vscode.DiagnosticSeverity;
+			if (before && before.top !== top) {
+				this.published.delete(key);
+				this.collection.delete(uri);
+				readd.set(key, entry);
+				continue;
+			}
+			this.published.set(key, { signature, top });
+			changed.push([uri, diagnostics]);
+		}
+		this.pending.clear();
+		for (const batch of batches(changed)) {
+			this.collection.set(batch);
+		}
+		if (readd.size > 0) {
+			readd.forEach((entry, key) => this.pending.set(key, entry));
+			this.schedulePublish();
+		}
 	}
 
 	/** The scope leak calls currently marked in `uri`. */
@@ -301,7 +401,7 @@ export class SqfDiagnostics implements vscode.Disposable {
 
 	private forget(uri: vscode.Uri): void {
 		const key = uri.toString();
-		this.collection.delete(uri);
+		this.show(uri, []);
 		this.callMarks.delete(uri);
 		this.files.delete(key);
 		const changedNames = this.index.remove(key);
@@ -319,7 +419,7 @@ export class SqfDiagnostics implements vscode.Disposable {
 		const state = this.files.get(key);
 		const leakingCalls = config.detectScopeLeaks ? (this.leaks.calls.get(key) ?? []) : [];
 		if (!state || (state.issues.length === 0 && leakingCalls.length === 0)) {
-			this.collection.delete(uri);
+			this.show(uri, []);
 			this.callMarks.delete(uri);
 			return 0;
 		}
@@ -349,7 +449,7 @@ export class SqfDiagnostics implements vscode.Disposable {
 				return toDiagnostic(issue, range, config, otherFiles, otherNonPrivateFiles);
 			})
 			.filter(shown);
-		this.collection.set(uri, diagnostics);
+		this.show(uri, diagnostics);
 		this.callMarks.set(uri, leakingCalls.map(call => leakingCallMark(call, positionAt, config, locate)).filter(shown));
 		return diagnostics.length;
 	}
@@ -398,6 +498,51 @@ function toRange(
 	const start = positionAt(span.start);
 	const end = positionAt(span.end);
 	return new vscode.Range(start.line, start.character, end.line, end.character);
+}
+
+/**
+ * `entries` split so that no batch holds more than `MAX_DIAGNOSTICS_PER_SET` diagnostics,
+ * except a single file with more on its own. One `set` call only passes on about 1100
+ * diagnostics to the Problems view (VS Code 1.139), silently dropping the files after
+ * those, however many it keeps for `languages.getDiagnostics`.
+ */
+function batches(entries: [vscode.Uri, vscode.Diagnostic[]][]): [vscode.Uri, vscode.Diagnostic[]][][] {
+	const result: [vscode.Uri, vscode.Diagnostic[]][][] = [];
+	let batch: [vscode.Uri, vscode.Diagnostic[]][] = [];
+	let count = 0;
+	for (const entry of entries) {
+		const size = entry[1].length;
+		if (batch.length > 0 && count + size > MAX_DIAGNOSTICS_PER_SET) {
+			result.push(batch);
+			batch = [];
+			count = 0;
+		}
+		batch.push(entry);
+		count += size;
+	}
+	if (batch.length > 0) {
+		result.push(batch);
+	}
+	return result;
+}
+
+/** Everything about a diagnostic that the Problems view or the editor shows, to tell whether it changed. */
+function diagnosticSignature(diagnostic: vscode.Diagnostic): string {
+	const { start, end } = diagnostic.range;
+	const related = (diagnostic.relatedInformation ?? []).map(info => {
+		const { uri, range } = info.location;
+		return `${uri.toString()}:${range.start.line}.${range.start.character}-${range.end.line}.${range.end.character}:${info.message}`;
+	});
+	return JSON.stringify([
+		start.line,
+		start.character,
+		end.line,
+		end.character,
+		diagnostic.severity,
+		diagnosticCode(diagnostic),
+		diagnostic.message,
+		related
+	]);
 }
 
 /** A compact description of a file's scope leaks, to tell whether it needs re-emitting. */

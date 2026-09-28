@@ -3,7 +3,7 @@
   "displayName": "SQF Private Variable Checker",
   "publisher": "Ezcoo",
   "description": "Checks all local variables and informs the user if there are issues with variable scopes, from minor issues to very high risk variables.",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "icon": "resources/icon.png",
   "repository": {
     "type": "git",
@@ -115,7 +115,7 @@
             "information",
             "hint"
           ],
-          "default": "warning",
+          "default": "information",
           "description": "Severity for a non-private local variable whose name is missing private in two or more different files in the workspace. Unlike duplicateNameSeverity (where only one side needs to be missing private), none of these occurrences has a private scope, so they can freely collide with each other."
         },
         "sqfPrivateVariableChecker.detectScopeLeaks": {

@@ -1,14 +1,25 @@
 # SQF Private Variable Checker
 
-Finds local variables in `.sqf` files that are assigned without ever being declared
-`private`. In SQF an undeclared `_variable` leaks into the caller's scope, which is a
-classic source of hard-to-trace bugs in Arma mission and mod code.
+Checks the scopes of local variables in Arma 3 mission and mod code. In SQF, a
+`_variable` assigned without being declared `private` overwrites any variable of the
+same name that already exists in an outer scope, and a function run with `call` runs
+inside its caller's scope, so a forgotten `private` in one file can silently change a
+variable in another. That is a classic source of hard-to-trace bugs.
+
+The checker reports these at every level of risk, from a plain missing `private`,
+through names that could collide with another file of the same mission, up to
+confirmed scope leaks: it follows `call` chains across the whole workspace, however
+many calls deep, and reports each assignment that really overwrites a caller's
+variable, and whether that caller reads it afterwards.
 
 ```sqf
-params ["_unit"];
+// init.sqf
+private _count = 0;
+call TAG_fnc_countNearby;   // overwrites _count, which is read on the next line
+hint str _count;
 
-private _position = getPosATL _unit;   // fine
-_speed = speed _unit;                  // assigned without being declared private
+// fn_countNearby.sqf
+_count = count (player nearEntities 50);   // SCOPE LEAK: assigned without private
 ```
 
 ## Features
@@ -32,8 +43,8 @@ _speed = speed _unit;                  // assigned without being declared privat
   non-private occurrence across the workspace (i.e. two or more files, not just one,
   all forgot `private` for the same name), it is reported separately from a plain
   duplicate-name collision: none of those occurrences has private scope protecting
-  it. Its own `highRiskSeverity` setting controls how severe that is (`warning` by
-  default). Both this and the duplicate-name check point at *possible* collisions; the
+  it. Its own `highRiskSeverity` setting controls how severe that is (`information`
+  by default). Both this and the duplicate-name check point at *possible* collisions; the
   scope leak check below reports the *confirmed* ones, as errors.
 - **Scope leak detection** — `call` runs the callee inside the caller's scope, so a
   non-private assignment in a called function overwrites the caller's variable of the
@@ -251,7 +262,7 @@ declare the variable `private` there.
 | `sqfPrivateVariableChecker.severity` | `information` | Severity for a plain missing-private variable: `error`, `warning`, `information` or `hint` |
 | `sqfPrivateVariableChecker.flagDuplicateLocalNames` | `true` | Cross-check non-private variables against every other `.sqf` file in the workspace |
 | `sqfPrivateVariableChecker.duplicateNameSeverity` | `information` | Severity for a non-private variable whose name is also used in another file |
-| `sqfPrivateVariableChecker.highRiskSeverity` | `warning` | Severity for a non-private variable whose name is missing `private` in two or more different files |
+| `sqfPrivateVariableChecker.highRiskSeverity` | `information` | Severity for a non-private variable whose name is missing `private` in two or more different files |
 | `sqfPrivateVariableChecker.detectScopeLeaks` | `true` | Follow `call` chains across files and report assignments that overwrite a caller's local variable |
 | `sqfPrivateVariableChecker.scopeLeakSeverity` | `error` | Severity for such a confirmed scope leak |
 | `sqfPrivateVariableChecker.unusedScopeLeakSeverity` | `warning` | Severity for a confirmed scope leak whose overwritten variable is never read afterwards, or that only assigns the value the call passes in |

@@ -57,7 +57,7 @@ export function readConfig(scope?: vscode.ConfigurationScope): CheckerConfig {
 		severity: toSeverity(config.get<string>('severity', 'information')),
 		duplicateNameSeverity: toSeverity(config.get<string>('duplicateNameSeverity', 'information')),
 		highRiskSeverity: toSeverity(
-			userValue(config, 'highRiskSeverity') ?? userValue(config, LEGACY_HIGH_RISK_SEVERITY) ?? 'warning'
+			userValue(config, 'highRiskSeverity') ?? userValue(config, LEGACY_HIGH_RISK_SEVERITY) ?? 'information'
 		),
 		detectScopeLeaks: config.get<boolean>('detectScopeLeaks', true),
 		scopeLeakSeverity: toSeverity(config.get<string>('scopeLeakSeverity', 'error')),

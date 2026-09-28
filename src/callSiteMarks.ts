@@ -103,24 +103,35 @@ export class CallSiteMarks implements vscode.Disposable {
 	}
 }
 
+/**
+ * The hover of a mark, laid out like VS Code's own hover for a diagnostic: the message,
+ * then `sqf-private(code)` with the code linking to its explanation, then a paragraph per
+ * related location, `file(line, column): message`. The diagnostic hover shows its text in
+ * the editor font; the message is a plain text code block, which is shown in that font
+ * too, and wrapped the same way. Links cannot go in a code block, so the rest is not.
+ */
 function hover(mark: CallSiteMark): vscode.MarkdownString {
 	const markdown = new vscode.MarkdownString();
-	const [headline, ...details] = mark.message.split('\n');
-	markdown.appendMarkdown(`**${escapeMarkdown(headline)}**\n\n`);
-	for (const line of details) {
-		markdown.appendText(line);
-		markdown.appendMarkdown('\n\n');
-	}
+	markdown.appendMarkdown(codeBlock(mark.message));
+	markdown.appendMarkdown(`\n\nsqf-private([${escapeMarkdown(mark.code.value)}](${mark.code.target.toString()}))`);
 	for (const info of mark.related) {
 		const { uri, range } = info.location;
 		const line = range.start.line + 1;
-		const target = uri.with({ fragment: `L${line},${range.start.character + 1}` });
-		const label = `${vscode.workspace.asRelativePath(uri)}:${line}`;
-		markdown.appendMarkdown(`\n\n- [${escapeMarkdown(label)}](${target.toString()}): `);
-		markdown.appendText(info.message);
+		const column = range.start.character + 1;
+		const target = uri.with({ fragment: `L${line},${column}` });
+		const name = uri.path.slice(uri.path.lastIndexOf('/') + 1);
+		markdown.appendMarkdown(
+			`\n\n[${escapeMarkdown(`${name}(${line}, ${column})`)}](${target.toString()}): ${escapeMarkdown(info.message)}`
+		);
 	}
-	markdown.appendMarkdown(`\n\n[sqf-private(${escapeMarkdown(mark.code.value)})](${mark.code.target.toString()})`);
 	return markdown;
+}
+
+/** `text` as a plain text Markdown code block, fenced with more backticks than any run inside it. */
+function codeBlock(text: string): string {
+	const longestRun = Math.max(0, ...(text.match(/`+/g) ?? []).map(run => run.length));
+	const fence = '`'.repeat(Math.max(3, longestRun + 1));
+	return `${fence}plaintext\n${text}\n${fence}`;
 }
 
 function escapeMarkdown(text: string): string {

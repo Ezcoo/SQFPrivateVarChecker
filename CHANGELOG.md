@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.6.0]
+
+- Fixed the Problems view listing only part of the issues, or none of them until it
+  was switched away from and back or a severity filter was toggled, while the issue
+  counters kept up. Diagnostics are now handed to VS Code in batches a few times a
+  second, not once per file checked, and files whose diagnostics did not change are
+  not sent again. No batch holds more than 1000 diagnostics, since VS Code silently
+  drops the files after about 1100 in a single update.
+- Files are listed in the Problems view by their most severe issue: files with errors
+  first, then warnings, then information. A workspace scan (on startup, or
+  `SQF: Check Workspace`) now shows its results once it is done, with their final
+  severities, rather than file by file as it goes. A file whose most severe issue
+  changes later is removed from the Problems view and added back, so that it moves
+  to its new place, since VS Code only sorts files as they are added.
+- The hover of a call through which a scope leak happens is now laid out like the
+  hover of a diagnostic: the message in the editor font, then
+  `sqf-private(scope-leak)` linking to its explanation, then a line per related
+  location, `file(line, column): message`.
+- High risk (`highRiskSeverity`) now defaults to `information` rather than `warning`,
+  so the only warnings by default are scope leaks that change nothing yet. The
+  Problems view sorts only by severity, file and position, so this keeps those right
+  after the errors. Set `highRiskSeverity` to `warning` to get the old behaviour.
+
 ## [0.5.0]
 
 - Fixed a false scope leak when the caller's variable is created by the statement that

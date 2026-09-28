@@ -235,12 +235,18 @@ async function indexWorkspaceQuietly(diagnostics: SqfDiagnostics): Promise<void>
 		return;
 	}
 
-	for (const uri of files) {
-		try {
-			await diagnostics.refreshFile(uri, config);
-		} catch {
-			// Best-effort background indexing; one unreadable file should not stop the rest.
+	diagnostics.hold();
+	try {
+		for (const uri of files) {
+			try {
+				await diagnostics.refreshFile(uri, config);
+			} catch {
+				// Best-effort background indexing; one unreadable file should not stop the rest.
+			}
 		}
+		diagnostics.flushScopeLeaks();
+	} finally {
+		diagnostics.release();
 	}
 }
 
@@ -284,27 +290,32 @@ async function checkWorkspace(diagnostics: SqfDiagnostics, output: vscode.Output
 			await indexFunctionConfigs(diagnostics, config.exclude);
 
 			const scanned: vscode.Uri[] = [];
-			for (const uri of files) {
-				if (token.isCancellationRequested) {
-					break;
+			diagnostics.hold();
+			try {
+				for (const uri of files) {
+					if (token.isCancellationRequested) {
+						break;
+					}
+
+					try {
+						await diagnostics.refreshFile(uri, config);
+						scanned.push(uri);
+					} catch (error) {
+						output.appendLine(`  ! ${vscode.workspace.asRelativePath(uri)}: ${describe(error)}`);
+					}
+
+					checked++;
+					progress.report({
+						increment: 100 / files.length,
+						message: `${checked}/${files.length}`
+					});
 				}
 
-				try {
-					await diagnostics.refreshFile(uri, config);
-					scanned.push(uri);
-				} catch (error) {
-					output.appendLine(`  ! ${vscode.workspace.asRelativePath(uri)}: ${describe(error)}`);
-				}
-
-				checked++;
-				progress.report({
-					increment: 100 / files.length,
-					message: `${checked}/${files.length}`
-				});
+				// Scope leaks follow calls between files, so they are only complete once every file is in.
+				diagnostics.flushScopeLeaks();
+			} finally {
+				diagnostics.release();
 			}
-
-			// Scope leaks follow calls between files, so they are only complete once every file is in.
-			diagnostics.flushScopeLeaks();
 
 			for (const uri of scanned) {
 				const found = diagnostics.shownCount(uri);

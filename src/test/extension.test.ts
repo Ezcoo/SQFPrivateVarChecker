@@ -73,7 +73,7 @@ suite('extension', () => {
 		for (const diagnostics of [firstDiagnostics, secondDiagnostics]) {
 			assert.strictEqual(diagnostics.length, 1);
 			assert.strictEqual(diagnosticCode(diagnostics[0]), DIAGNOSTIC_CODE_HIGH_RISK);
-			assert.strictEqual(diagnostics[0].severity, vscode.DiagnosticSeverity.Warning);
+			assert.strictEqual(diagnostics[0].severity, vscode.DiagnosticSeverity.Information);
 			assert.ok(diagnostics[0].message.toLowerCase().includes('high risk'));
 		}
 	});
